@@ -37,6 +37,9 @@ setup_fixture() {
   # propagating environment variables into new sessions.
   mkdir -p "${TESTDIR}/bin"
   printf '300\n' >"${TESTDIR}/claude_sleep"
+  # SC2016 is the point here: the $(cat ...) must stay literal so it is
+  # evaluated when the shim runs, not when the shim is written.
+  # shellcheck disable=SC2016
   printf '#!/bin/sh\nexec sleep "$(cat %s/claude_sleep 2>/dev/null || echo 300)"\n' \
     "$TESTDIR" >"${TESTDIR}/bin/claude"
   chmod +x "${TESTDIR}/bin/claude"
