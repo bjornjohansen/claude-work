@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# claude-work.sh — spin up a git worktree + tmux session + Claude Code for one issue
+# claude-work — spin up a git worktree + tmux session + Claude Code for one issue
 #
 # Version: 0.1.0
 #
 # Usage:
-#   claude-work.sh <issue-slug> [base-branch]
+#   claude-work <issue-slug> [base-branch]
 #
 # Example:
-#   claude-work.sh issue-123
-#   claude-work.sh issue-456 develop
+#   claude-work issue-123
+#   claude-work issue-456 develop
 #
 # Environment:
 #   GIT_REMOTE     Remote to fetch the base branch from (default: origin)

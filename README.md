@@ -4,15 +4,15 @@ Spin up a git worktree, a tmux session and [Claude Code](https://claude.com/clau
 issue — with one command, and clean up afterwards.
 
 Working on several issues at once means either stashing constantly or juggling checkouts by hand.
-`claude-work.sh` gives each issue its own worktree, its own branch and its own long-lived tmux
+`claude-work` gives each issue its own worktree, its own branch and its own long-lived tmux
 session, so you can leave a Claude Code session running on one issue, detach, and start another.
 
 ## Usage
 
 ```bash
 cd ~/dev/myrepo
-./claude-work.sh issue-123            # branch off main
-./claude-work.sh issue-456 develop    # branch off develop
+claude-work issue-123            # branch off main
+claude-work issue-456 develop    # branch off develop
 ```
 
 For the slug `issue-123` in a repo called `myrepo`, this:
@@ -61,7 +61,7 @@ When stdin is not a terminal, cleanup is always skipped. Nothing is deleted non-
 | `BRANCH_PREFIX` | `fix` | Prefix for the created branch |
 
 ```bash
-BRANCH_PREFIX=feat ./claude-work.sh new-onboarding
+BRANCH_PREFIX=feat claude-work new-onboarding
 ```
 
 If the base branch cannot be fetched, the script warns and falls back to the local branch rather
