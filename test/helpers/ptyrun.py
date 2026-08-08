@@ -34,6 +34,12 @@ def main() -> int:
         print("pty.py: no command given", file=sys.stderr)
         return 2
 
+    # CI and containers hand us TERM=dumb (or nothing), and tmux refuses to
+    # attach to a terminal that cannot clear. We are supplying a real pty, so
+    # advertise a terminal type that tmux will accept.
+    if os.environ.get("TERM", "dumb") in ("", "dumb", "unknown"):
+        os.environ["TERM"] = "xterm"
+
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp(command[0], command)
