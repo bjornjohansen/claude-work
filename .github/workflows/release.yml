@@ -85,4 +85,12 @@ jobs:
           installed=$(sed -n 's/^# Version:[[:space:]]*//p' "${RUNNER_TEMP}/bin/claude-work" | head -n 1)
           echo "installed=${installed} tag=${GITHUB_REF_NAME}"
           [ "v${installed}" = "${GITHUB_REF_NAME}" ]
-          "${RUNNER_TEMP}/bin/claude-work" 2>&1 | grep -q "Usage: claude-work"
+          # claude-work exits 1 when printing usage, which is correct behaviour.
+          # Capture first: piping it into grep under `set -o pipefail` would fail
+          # the step on that intentional exit status.
+          out=$("${RUNNER_TEMP}/bin/claude-work" 2>&1 || true)
+          echo "$out"
+          case "$out" in
+            *"Usage: claude-work"*) ;;
+            *) echo "::error::installed command did not print usage"; exit 1 ;;
+          esac
