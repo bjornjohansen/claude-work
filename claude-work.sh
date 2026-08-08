@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+#
+# claude-work.sh — spin up a git worktree + tmux session + Claude Code for one issue
+#
+# Version: 0.1.0
+#
+# Usage:
+#   claude-work.sh <issue-slug> [base-branch]
+#
+# Example:
+#   claude-work.sh issue-123
+#   claude-work.sh issue-456 develop
+#
+# Environment:
+#   GIT_REMOTE     Remote to fetch the base branch from (default: origin)
+#   BRANCH_PREFIX  Prefix for the created branch     (default: fix)
+#
+# What it does:
+#   1. Creates a new worktree at ../<repo>-<issue-slug>
+#   2. Creates/checks out branch <prefix>/<issue-slug> off base-branch (default: main)
+#   3. Opens (or attaches to) a tmux session named after the slug
+#   4. Launches `claude` inside it
+#
+# Safe to re-run: if the worktree/branch/tmux session already exist, it just attaches.
+#
+# Portability: targets bash 3.2, the stock /bin/bash on macOS. Do not introduce
+# ${var,,}, associative arrays, mapfile, or other bash 4+ constructs.
+
+set -euo pipefail
+
+SLUG="${1:-}"
+BASE_BRANCH="${2:-main}"
+REMOTE="${GIT_REMOTE:-origin}"
+BRANCH_PREFIX="${BRANCH_PREFIX:-fix}"
+
+# --- Helpers ---
+
+# Ask a yes/no question. Returns non-zero (i.e. "no") when stdin is not a
+# terminal or is at EOF, so non-interactive runs take the safe path instead of
+# dying on `read` under `set -e`.
+confirm() {
+  local reply
+  [[ -t 0 ]] || return 1
+  read -r -p "$1 [y/N] " reply || return 1
+  [[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
+}
+
+# True if $1 is a path git currently tracks as a worktree of this repo.
+# Checking the registry — not just `-d` — is what stops a leftover or unrelated
+# directory from being silently treated as a worktree.
+worktree_registered() {
+  git worktree list --porcelain | grep -Fxq "worktree $1"
+}
+
+# Count commits on the worktree's HEAD that are not yet on its upstream. Falls
+# back to the base branch when no upstream is configured. Echoes 0 when it
+# genuinely cannot tell — `git branch -d` refusing unmerged branches is the real
+# backstop for committed work; this check only drives the warning.
+unpushed_commit_count() {
+  local wt="$1" upstream base
+  if upstream=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+    git -C "$wt" rev-list --count "${upstream}..HEAD" 2>/dev/null || echo 0
+    return
+  fi
+  for base in "${REMOTE}/${BASE_BRANCH}" "$BASE_BRANCH"; do
+    if git -C "$wt" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+      git -C "$wt" rev-list --count "${base}..HEAD" 2>/dev/null || echo 0
+      return
+    fi
+  done
+  echo 0
+}
+
+# Attach to a session, or switch to it when we are already inside tmux.
+# switch-client returns immediately, so there is no session to wait on and the
+# "did claude exit?" test below would be meaningless — we exit instead.
+attach_session() {
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$1"
+    echo "Switched to ${1}. (Already inside tmux — cleanup prompt skipped.)"
+    exit 0
+  fi
+  tmux attach-session -t "$1"
+}
+
+# --- 0. Preflight ---
+
+if [[ -z "$SLUG" ]]; then
+  echo "Usage: $(basename "$0") <issue-slug> [base-branch]" >&2
+  exit 1
+fi
+
+# The slug becomes a filesystem path, a git refname and a tmux target, so keep
+# it to characters that are unambiguous in all three.
+if [[ ! "$SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$SLUG" == *..* ]]; then
+  echo "Error: slug must start with a letter or digit and contain only [A-Za-z0-9._-], with no '..'." >&2
+  exit 1
+fi
+
+for cmd in git tmux claude; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: required command '${cmd}' not found on PATH." >&2
+    exit 1
+  fi
+done
+
+# Resolve the *main* repository, not the current checkout: --show-toplevel would
+# return the linked worktree when this script is run from inside one, which would
+# nest worktree names (repo-issue-1-issue-2).
+GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "Error: not inside a git repository." >&2
+  exit 1
+}
+REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd -P)
+REPO_NAME=$(basename "$REPO_ROOT")
+PARENT_DIR=$(dirname "$REPO_ROOT")
+
+WORKTREE_DIR="${PARENT_DIR}/${REPO_NAME}-${SLUG}"
+BRANCH="${BRANCH_PREFIX}/${SLUG}"
+# ':' separates session from window and '.' separates window from pane in tmux
+# target syntax, so neither may survive into the session name.
+SESSION_NAME="cc-${REPO_NAME}-${SLUG}"
+SESSION_NAME="${SESSION_NAME//[.:]/-}"
+
+cd "$REPO_ROOT"
+
+# --- 1. Create worktree if it doesn't already exist ---
+
+# Drops registrations whose directory was deleted by hand; without this,
+# `worktree add` fails with "missing but already registered".
+git worktree prune
+
+if worktree_registered "$WORKTREE_DIR"; then
+  echo "Worktree already exists at $WORKTREE_DIR — reusing it."
+elif [[ -e "$WORKTREE_DIR" ]]; then
+  echo "Error: ${WORKTREE_DIR} exists but is not a registered worktree of ${REPO_NAME}." >&2
+  echo "Move or remove it, then re-run." >&2
+  exit 1
+elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+  echo "Branch ${BRANCH} already exists — attaching worktree to it."
+  git worktree add "$WORKTREE_DIR" "$BRANCH"
+else
+  # Decide the start point up front. The old code retried `worktree add` on any
+  # failure, which turned unrelated errors ("already checked out elsewhere")
+  # into a misleading second error.
+  if git fetch --quiet "$REMOTE" "$BASE_BRANCH" 2>/dev/null &&
+    git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${BASE_BRANCH}" >/dev/null; then
+    START_POINT="${REMOTE}/${BASE_BRANCH}"
+  elif git rev-parse --verify --quiet "refs/heads/${BASE_BRANCH}" >/dev/null; then
+    echo "Warning: could not fetch ${REMOTE}/${BASE_BRANCH}; branching off local ${BASE_BRANCH}." >&2
+    START_POINT="$BASE_BRANCH"
+  else
+    echo "Error: neither ${REMOTE}/${BASE_BRANCH} nor a local ${BASE_BRANCH} could be resolved." >&2
+    exit 1
+  fi
+
+  echo "Creating worktree + branch ${BRANCH} off ${START_POINT}..."
+  git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$START_POINT"
+fi
+
+# Deliberately no shared node_modules symlink between worktrees: the moment two
+# branches disagree on dependencies, a shared tree gives both of them the wrong
+# packages. Let each worktree install its own.
+
+# --- 2. Attach to (or create) a tmux session in the worktree, running claude ---
+#
+# Note: we deliberately do NOT exec into tmux attach here. We need the script
+# to regain control after attach returns, so we can tell whether Claude Code
+# actually exited (session ended -> offer cleanup) or you just detached
+# (session still alive -> leave everything alone).
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "tmux session ${SESSION_NAME} already running — attaching."
+  attach_session "$SESSION_NAME"
+else
+  echo "Starting tmux session ${SESSION_NAME} in ${WORKTREE_DIR}..."
+  # Running claude as the session's command (rather than send-keys into a shell)
+  # avoids racing the shell's startup, and still ends the session when claude
+  # quits — which is what lets us tell "exited" apart from "detached" below.
+  # Trade-off: this resolves `claude` on PATH, so a shell alias or function by
+  # that name would not be picked up.
+  tmux new-session -d -s "$SESSION_NAME" -c "$WORKTREE_DIR" claude
+
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Error: session ${SESSION_NAME} exited immediately — 'claude' failed to start in ${WORKTREE_DIR}." >&2
+    exit 1
+  fi
+
+  attach_session "$SESSION_NAME"
+fi
+
+# --- 3. Detect whether the session ended (claude quit) or is still running (detached) ---
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo
+  echo "Detached from ${SESSION_NAME} (still running)."
+  echo "Reattach anytime with: tmux attach -t ${SESSION_NAME}"
+  exit 0
+fi
+
+echo
+echo "Claude Code session for '${SLUG}' has ended."
+
+# --- 4. Offer cleanup ---
+if ! confirm "Remove worktree and delete branch '${BRANCH}'?"; then
+  echo "Skipping cleanup. Worktree left in place at ${WORKTREE_DIR}."
+  exit 0
+fi
+
+# Refuse to remove a worktree with uncommitted or unpushed work without a nudge
+DIRTY=$(git -C "$WORKTREE_DIR" status --porcelain)
+UNPUSHED=$(unpushed_commit_count "$WORKTREE_DIR")
+UNPUSHED="${UNPUSHED:-0}"
+
+if [[ -n "$DIRTY" || "$UNPUSHED" -gt 0 ]]; then
+  # `cmd && echo` would abort the script under `set -e` when cmd is false.
+  if [[ -n "$DIRTY" ]]; then
+    echo "Warning: ${WORKTREE_DIR} has uncommitted changes."
+  fi
+  if [[ "$UNPUSHED" -gt 0 ]]; then
+    echo "Warning: ${BRANCH} has ${UNPUSHED} commit(s) not on its upstream."
+  fi
+  if ! confirm "Remove anyway? Uncommitted changes are discarded."; then
+    echo "Skipping cleanup. Worktree left in place at ${WORKTREE_DIR}."
+    exit 0
+  fi
+  git worktree remove --force "$WORKTREE_DIR"
+else
+  git worktree remove "$WORKTREE_DIR"
+fi
+
+# -d is safe (fails if unmerged); use -D only if you're sure
+if git branch -d "$BRANCH"; then
+  echo "Removed worktree and deleted branch ${BRANCH}."
+else
+  echo "Worktree removed. Branch ${BRANCH} was NOT deleted (see reason above)."
+  echo "Delete manually with: git branch -D ${BRANCH}"
+fi
