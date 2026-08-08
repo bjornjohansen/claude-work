@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-09
+
+### Added
+
+- `install.sh` — one-line installer for macOS and Linux. Downloads a released build, verifies it
+  against the `SHA256SUMS` published with that release, and installs to `/usr/local/bin` when
+  writable or `~/.local/bin` otherwise. Supports `--version`, `--prefix`, `--modify-path`,
+  `--uninstall` and `--dry-run`, and never escalates privileges on its own.
+- Continuous integration: shellcheck, a 16-case bats suite on Linux and macOS, a dedicated job
+  pinned to macOS `/bin/bash` so the documented bash 3.2 support is enforced, and an end-to-end
+  `install.sh` run on both platforms.
+- Tag-driven releases that publish the script and its `SHA256SUMS`, with release notes taken from
+  this changelog and a post-release smoke test that installs the published artifact.
+- `scripts/bump-version.sh` to move the version forward in the script and changelog together.
+
+### Changed
+
+- **Breaking:** `claude-work.sh` moved to `bin/claude-work`. The installed command is now
+  `claude-work`, with no extension. Anyone running the script from a clone should use the new path
+  or install it properly.
+
 ## [0.1.0] - 2026-08-09
 
 ### Added
@@ -25,5 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GIT_REMOTE` and `BRANCH_PREFIX` environment variables.
 - Offline fallback to the local base branch, with a warning, when the remote cannot be fetched.
 
-[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bjornjohansen/claude-work/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bjornjohansen/claude-work/releases/tag/v0.1.0

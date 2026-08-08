@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Called by release.yml so a tag can never ship unlinted or untested code.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint the tool (bash)
+        run: shellcheck -x bin/claude-work
+      - name: Lint the installer (POSIX sh)
+        run: shellcheck -s sh install.sh
+      - name: Lint test helpers
+        run: shellcheck -x test/helpers/common.bash
+      - name: Check the installed command is executable
+        run: test -x bin/claude-work
+
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Script version must match the newest CHANGELOG entry
+        run: |
+          set -euo pipefail
+          script_version=$(sed -n 's/^# Version:[[:space:]]*//p' bin/claude-work | head -n 1)
+          changelog_version=$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -n 1)
+          echo "script:    ${script_version}"
+          echo "changelog: ${changelog_version}"
+          if [ "$script_version" != "$changelog_version" ]; then
+            echo "::error::version drift — bin/claude-work says ${script_version}, CHANGELOG.md says ${changelog_version}"
+            exit 1
+          fi
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install tmux and bats (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux bats
+      - name: Install tmux and bats (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux bats-core
+      - name: Run the test suite
+        run: bats test/
+
+  # The documented bash 3.2 compatibility is only a promise until something
+  # checks it. macOS runners still ship 3.2 at /bin/bash.
+  test-bash32:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Confirm /bin/bash really is 3.2
+        run: /bin/bash --version | head -1
+      - name: Install tmux and bats
+        run: brew install tmux bats-core
+      - name: Run the test suite under bash 3.2
+        env:
+          CW_BASH: /bin/bash
+        run: bats test/
+
+  # install.sh is the only distribution channel, so it is exercised on both
+  # platforms for every change rather than only at release time.
+  test-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install from this commit
+        run: sh install.sh --ref "${GITHUB_SHA}" --prefix "${RUNNER_TEMP}/bin"
+      - name: Installed command runs
+        run: |
+          set -euo pipefail
+          test -x "${RUNNER_TEMP}/bin/claude-work"
+          out=$("${RUNNER_TEMP}/bin/claude-work" 2>&1 || true)
+          echo "$out"
+          case "$out" in
+            *"Usage: claude-work"*) ;;
+            *) echo "::error::installed command did not print usage"; exit 1 ;;
+          esac
+      - name: Uninstall removes it again
+        run: |
+          set -euo pipefail
+          sh install.sh --uninstall --prefix "${RUNNER_TEMP}/bin"
+          test ! -f "${RUNNER_TEMP}/bin/claude-work"

@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # A tag must not be able to ship code that would fail on main.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Tag, script and changelog must all agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          script_version=$(sed -n 's/^# Version:[[:space:]]*//p' bin/claude-work | head -n 1)
+          changelog_version=$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -n 1)
+          echo "tag=${tag} script=${script_version} changelog=${changelog_version}"
+          if [ "$tag" != "v${script_version}" ] || [ "$script_version" != "$changelog_version" ]; then
+            echo "::error::version mismatch between tag, bin/claude-work and CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Build checksums
+        run: |
+          set -euo pipefail
+          cp bin/claude-work ./claude-work
+          sha256sum claude-work > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract release notes for this version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { capture = 1; next }
+            capture && /^## \[/     { exit }
+            capture                 { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::no CHANGELOG.md section found for ${version}"
+            exit 1
+          fi
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            claude-work SHA256SUMS
+
+  # Proves the real user-facing install path works against the published
+  # release, not just the code path CI simulated from a git ref.
+  smoke:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install the published release the way the README says to
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/install.sh" \
+            | bash -s -- --version "${GITHUB_REF_NAME#v}" --prefix "${RUNNER_TEMP}/bin"
+
+      - name: Installed version matches the tag
+        run: |
+          set -euo pipefail
+          installed=$(sed -n 's/^# Version:[[:space:]]*//p' "${RUNNER_TEMP}/bin/claude-work" | head -n 1)
+          echo "installed=${installed} tag=${GITHUB_REF_NAME}"
+          [ "v${installed}" = "${GITHUB_REF_NAME}" ]
+          "${RUNNER_TEMP}/bin/claude-work" 2>&1 | grep -q "Usage: claude-work"

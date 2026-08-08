@@ -4,15 +4,47 @@ Spin up a git worktree, a tmux session and [Claude Code](https://claude.com/clau
 issue — with one command, and clean up afterwards.
 
 Working on several issues at once means either stashing constantly or juggling checkouts by hand.
-`claude-work.sh` gives each issue its own worktree, its own branch and its own long-lived tmux
+`claude-work` gives each issue its own worktree, its own branch and its own long-lived tmux
 session, so you can leave a Claude Code session running on one issue, detach, and start another.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bjornjohansen/claude-work/main/install.sh | bash
+```
+
+Piping a script from the internet into a shell runs code you have not read. If you would rather look
+first — and you should — the installer is a single self-contained file:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bjornjohansen/claude-work/main/install.sh -o install.sh
+less install.sh
+sh install.sh          # user install  → ~/.local/bin
+sudo sh install.sh     # system-wide   → /usr/local/bin
+```
+
+The installer downloads the release build, checks it against the `SHA256SUMS` published with that
+release, and refuses to install on a mismatch. It never runs `sudo` on your behalf: without root it
+installs to `~/.local/bin` and tells you if that is not on your `PATH`.
+
+Useful options — pass them after `--` when piping:
+
+```bash
+curl -fsSL .../install.sh | bash -s -- --version 0.2.0        # pin a release
+curl -fsSL .../install.sh | bash -s -- --prefix ~/bin         # choose the directory
+curl -fsSL .../install.sh | bash -s -- --modify-path          # add it to your shell rc
+sh install.sh --uninstall                                     # remove it again
+sh install.sh --help                                          # everything else
+```
+
+Re-running the installer upgrades in place, and reports when you are already on the newest version.
 
 ## Usage
 
 ```bash
 cd ~/dev/myrepo
-./claude-work.sh issue-123            # branch off main
-./claude-work.sh issue-456 develop    # branch off develop
+claude-work issue-123            # branch off main
+claude-work issue-456 develop    # branch off develop
 ```
 
 For the slug `issue-123` in a repo called `myrepo`, this:
@@ -61,7 +93,7 @@ When stdin is not a terminal, cleanup is always skipped. Nothing is deleted non-
 | `BRANCH_PREFIX` | `fix` | Prefix for the created branch |
 
 ```bash
-BRANCH_PREFIX=feat ./claude-work.sh new-onboarding
+BRANCH_PREFIX=feat claude-work new-onboarding
 ```
 
 If the base branch cannot be fetched, the script warns and falls back to the local branch rather
@@ -78,6 +110,24 @@ than failing outright — useful offline.
   racing shell startup, but means a shell alias or function named `claude` is not picked up.
 - Each worktree gets its own dependencies. Nothing is symlinked between them, because two branches
   that disagree on dependencies would otherwise share the wrong ones.
+
+## Development
+
+```bash
+brew install shellcheck bats-core   # or: sudo apt install shellcheck bats
+shellcheck -x bin/claude-work
+shellcheck -s sh install.sh
+bats test/
+CW_BASH=/bin/bash bats test/        # the bash 3.2 compatibility check
+```
+
+The suite creates throwaway repositories and runs tmux on an isolated socket, so it cannot disturb
+your own sessions. Cleanup prompts are driven through a pty helper, because the tool refuses to act
+on them without a terminal.
+
+Releases are cut by tag. `scripts/bump-version.sh X.Y.Z` updates the version header and the
+changelog together; pushing the `vX.Y.Z` tag builds the release and publishes it. CI fails the build
+if the script version, the changelog and the tag ever disagree.
 
 ## License
 
