@@ -53,6 +53,12 @@ BRANCH_PREFIX="${BRANCH_PREFIX:-fix}"
 CW_SELF="${BASH_SOURCE[0]}"
 case "$CW_SELF" in /*) ;; *) CW_SELF="${PWD}/${CW_SELF}" ;; esac
 
+# Set here rather than only where they are raised, so that inheriting either
+# from the environment cannot decide our behaviour — _CW_SESSION_ENDED in
+# particular is what allows the exit trap to ask a question.
+_CW_QUIET=""
+_CW_SESSION_ENDED=""
+
 # --- Helpers ---
 
 # Ask a yes/no question. Returns non-zero (i.e. "no") when stdin is not a
@@ -245,6 +251,12 @@ cw_cache_read() {
   # is the only thing between a writable cache file and a shell.
   c="${c:-0}"
   case "$c" in '' | *[!0-9]*) c=0 ;; esac
+  # Digits alone are not enough to be a safe arithmetic operand: "0999990" is
+  # read as octal and errors out, and an absurdly long run of digits overflows.
+  # Either would abort the staleness test and make the check refetch on every
+  # single run. Bound the length, then normalise base 10.
+  [ "${#c}" -le 12 ] || c=0
+  c=$((10#$c))
   cw_is_semver "${l:-}" || l=-
   cw_is_semver "${d:-}" || d=-
 
@@ -305,7 +317,15 @@ cw_update_fetch() {
     -o /dev/null -w '%{redirect_url}' \
     "$CW_RELEASES_LATEST_URL") || return 0
 
-  [ -z "${CLAUDE_WORK_UPDATE_DEBUG:-}" ] || echo "claude-work: redirect_url=${url}" >&2
+  # Debug output goes to a real terminal, and this string came off the wire —
+  # a Location header carrying escape sequences must not be replayed into the
+  # user's pane just because they asked why the check found nothing.
+  if [ -n "${CLAUDE_WORK_UPDATE_DEBUG:-}" ]; then
+    case "$url" in
+    *[!A-Za-z0-9:/._~%?\#=-]*) echo "claude-work: redirect_url=(unprintable)" >&2 ;;
+    *) echo "claude-work: redirect_url=${url}" >&2 ;;
+    esac
+  fi
 
   # Match the whole expected prefix, not just the shape of the tail: captive
   # portals answer with a 302 of their own, and a semver check alone would
@@ -428,7 +448,11 @@ cw_drain_input() {
 cw_offer_upgrade() {
   cw_drain_input
   if confirm "Upgrade claude-work to ${CW_LATEST} now?"; then
-    cw_do_upgrade
+    # A failed upgrade reports itself and is deliberately not propagated: the
+    # session did its job, and turning that into a non-zero exit would break
+    # anything scripting this tool over an optional extra that was offered
+    # rather than asked for. `claude-work --upgrade` does propagate it.
+    cw_do_upgrade || :
     return 0
   fi
   # Remember the refusal, but keep the existing timestamp so declining does not
@@ -471,7 +495,10 @@ cw_self_dir() {
 cw_do_upgrade() {
   local dir tmpd rc
 
-  dir=$(cw_self_dir)
+  # `|| dir=""` because cw_self_dir ends in a subshell that fails when the
+  # directory has gone; without it `set -e` would abort here and the message
+  # below — the whole reason the check exists — would never be printed.
+  dir=$(cw_self_dir) || dir=""
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then
     echo "Error: could not work out where claude-work is installed." >&2
     return 1

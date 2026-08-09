@@ -244,7 +244,7 @@ in_lib() {
 @test "a newer cached version is announced when the session ends" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 9.9.9 -
-  run cw_pty n -- issue-notice
+  run cw_pty n n -- issue-notice
   [[ "$output" == *"claude-work 9.9.9 is available (you have "* ]]
   [[ "$output" == *"releases/tag/v9.9.9"* ]]
 }
@@ -252,7 +252,7 @@ in_lib() {
 @test "the notice comes after the cleanup prompt, not before" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 9.9.9 -
-  run cw_pty y -- issue-order
+  run cw_pty y n -- issue-order
   local cleanup notice
   cleanup=$(printf '%s\n' "$output" | grep -n 'Removed worktree' | head -1 | cut -d: -f1)
   notice=$(printf '%s\n' "$output" | grep -n 'is available' | head -1 | cut -d: -f1)
@@ -264,7 +264,7 @@ in_lib() {
 @test "an older cached version says nothing" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 0.0.1 -
-  run cw_pty n -- issue-older
+  run cw_pty n n -- issue-older
   [[ "$output" != *"is available"* ]]
 }
 
@@ -277,7 +277,7 @@ in_lib() {
 @test "a declined version is not announced again" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 9.9.9 9.9.9
-  run cw_pty n -- issue-declined
+  run cw_pty n n -- issue-declined
   [[ "$output" != *"is available"* ]]
 }
 
@@ -424,14 +424,20 @@ in_lib() {
   [ "$(cat "$CACHE_FILE")" = "4242 9.9.9 9.9.9" ]
 }
 
-@test "the notice goes to stderr" {
+@test "the notice goes to stderr, not stdout" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 9.9.9 -
-  run cw_pty n -- issue-stderr
-  [[ "$output" == *"is available"* ]]
 
-  # Same run with stderr discarded: the notice must be the thing that vanishes.
-  run "$CW_BASH" -c '
-    python3 "$1" n -- "$2" "$3" issue-stderr2 2>/dev/null
-  ' _ "${CW_ROOT}/test/helpers/ptyrun.py" "$CW_BASH" "$CW_SCRIPT"
+  # Still on a pty, so the tty gate is satisfied, but with the tool's stdout
+  # sent to a file — so whatever arrives on the pty is what it wrote to stderr.
+  run python3 "${CW_ROOT}/test/helpers/ptyrun.py" n n -- \
+    "$CW_BASH" -c '"$0" "$1" issue-stderr >"$2"' \
+    "$CW_BASH" "$CW_SCRIPT" "${TESTDIR}/stdout.txt"
+
+  # The notice reached stderr...
+  [[ "$output" == *"is available"* ]]
+  # ...the redirect really was in effect...
+  grep -q 'has ended' "${TESTDIR}/stdout.txt"
+  # ...and the notice is not in the tool's own output.
+  ! grep -q 'is available' "${TESTDIR}/stdout.txt"
 }

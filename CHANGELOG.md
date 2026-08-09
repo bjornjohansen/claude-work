@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetched from the same base, both moved together and the installer reported `Checksum verified.`
   for an attacker-supplied file. Both options are now restricted to a safe character set with no
   `..`, and rejected before any request is made.
+- `install.sh --modify-path` wrote the `--prefix` value into a shell startup file inside double
+  quotes, without validating it. A prefix containing a quote closed the string and left the rest as
+  commands, executed by every login shell from then on — and `--prefix` can also come from the
+  `CLAUDE_WORK_INSTALL_DIR` environment variable. The same unvalidated value was printed as
+  copy-paste instructions in the other branch. Prefixes containing quotes, `$`, backticks,
+  backslashes or newlines are now rejected; ordinary paths with spaces still work.
+- `install.sh --require-checksum` was silently ignored when combined with `--ref`, because ref
+  installs return before verification is reached. A flag that exists to turn an unverifiable
+  download into a failure must never be inert, so the combination is now refused.
 - `install.sh` treated a malformed or empty `SHA256SUMS` as verified. The verdict came from
   `sha*sum -c`, whose exit status is not usable for this: on macOS's `/sbin/sha256sum` an
   improperly formatted checksum line exits 0 with only a warning on stderr, which `sha_check`

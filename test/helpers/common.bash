@@ -138,6 +138,7 @@ EOF
 # Run the background check's body in the foreground, so a test can assert on
 # what it did without racing a detached child.
 run_fetch() {
+  # shellcheck disable=SC2016 # $1 is the argument passed to `bash -c`
   "$CW_BASH" -c '. "$1"; set +e; cw_update_fetch' _ "$UPDATE_LIB"
 }
 

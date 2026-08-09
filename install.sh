@@ -27,6 +27,9 @@ RAW_BASE="https://raw.githubusercontent.com/${REPO}"
 PATH_MARKER="# added by claude-work install.sh"
 
 TMPDIR_CW=""
+# The file staged next to the install target, tracked so an interrupt between
+# creating and renaming it does not leave it behind in /usr/local/bin.
+STAGED_CW=""
 
 # --- output helpers -------------------------------------------------------
 
@@ -41,6 +44,7 @@ die() {
 
 cleanup() {
   [ -n "$TMPDIR_CW" ] && [ -d "$TMPDIR_CW" ] && rm -rf "$TMPDIR_CW"
+  [ -n "$STAGED_CW" ] && [ -f "$STAGED_CW" ] && rm -f "$STAGED_CW"
   return 0
 }
 
@@ -85,9 +89,13 @@ download() {
   dest="$2"
   if have curl; then
     # --fail so an HTML 404 page is never written out as if it were the tool.
-    curl -fsSL --proto '=https' --tlsv1.2 -o "$dest" "$url"
+    # --proto '=https' also constrains redirects, so -L cannot be downgraded.
+    curl -fsSL --proto '=https' --tlsv1.2 \
+      --connect-timeout 10 --max-time 120 \
+      -o "$dest" "$url"
   elif have wget; then
-    wget -qO "$dest" "$url"
+    # --https-only is wget's equivalent of --proto '=https' for redirects.
+    wget -q --https-only --timeout=30 --tries=2 -O "$dest" "$url"
   else
     die "need curl or wget to download ${BIN_NAME}"
   fi
@@ -111,9 +119,14 @@ sha256_of() {
   fi
 }
 
+# The version of an installed copy is echoed back to the terminal, and the file
+# it comes from is not necessarily one we wrote — so it gets the same charset
+# guard bin/claude-work applies to the identical field.
 script_version() {
   [ -f "$1" ] || return 1
-  sed -n 's/^# Version:[[:space:]]*//p' "$1" | head -n 1
+  v=$(sed -n 's/^# Version:[[:space:]]*//p' "$1" | head -n 1)
+  case "$v" in '' | *[!0-9.]*) return 1 ;; esac
+  printf '%s\n' "$v"
 }
 
 on_path() {
@@ -288,15 +301,18 @@ report_path_situation() {
   target_dir="$1"
   on_path "$target_dir" && return 0
 
-  rc=$(rc_file)
+  # Not `rc`: fetch_binary uses that name for a numeric status. POSIX sh has no
+  # `local`, so every function name is shared, and this file has already been
+  # bitten once by exactly that (see the note in fetch_binary).
+  rc_path=$(rc_file)
   line="export PATH=\"${target_dir}:\$PATH\""
 
   if [ "$OPT_MODIFY_PATH" = "yes" ]; then
-    if [ -f "$rc" ] && grep -Fq "$PATH_MARKER" "$rc" 2>/dev/null; then
-      info "PATH entry already present in ${rc}."
+    if [ -f "$rc_path" ] && grep -Fq "$PATH_MARKER" "$rc_path" 2>/dev/null; then
+      info "PATH entry already present in ${rc_path}."
     else
-      printf '\n%s\n%s\n' "$PATH_MARKER" "$line" >>"$rc"
-      info "Added ${target_dir} to PATH in ${rc}."
+      printf '\n%s\n%s\n' "$PATH_MARKER" "$line" >>"$rc_path"
+      info "Added ${target_dir} to PATH in ${rc_path}."
       info "Run 'exec \$SHELL' or open a new terminal to pick it up."
     fi
     return 0
@@ -305,7 +321,7 @@ report_path_situation() {
   warn "${target_dir} is not on your PATH."
   info "Add it by running:"
   info ""
-  info "  echo '${line}' >> ${rc}"
+  info "  echo '${line}' >> ${rc_path}"
   info ""
   info "or re-run this installer with --modify-path."
 }
@@ -410,11 +426,14 @@ install_binary() {
   # directory someone else can write is a symlink target they can plant, and
   # then the copy below writes through it as whoever ran this script.
   tmp=$(mktemp "${target_dir}/.${BIN_NAME}.XXXXXX" 2>/dev/null) ||
-    die "could not write to ${target_dir} — try 'sudo sh ${0}' or --prefix DIR"
+    die "could not write to ${target_dir} — try 'sudo sh ${0} --prefix \"${target_dir}\"'"
+  STAGED_CW="$tmp"
   if ! (cat "$src" >"$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$target") 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
+    STAGED_CW=""
     die "could not write ${target} — try 'sudo sh ${0} --prefix \"${target_dir}\"'"
   fi
+  STAGED_CW=""
 
   info "Installed ${target}"
   report_path_situation "$target_dir"
@@ -490,6 +509,26 @@ main() {
   case "$OPT_REF" in
   '') ;;
   *[!A-Za-z0-9._/-]* | *..*) die "invalid --ref: expected a branch, tag or SHA" ;;
+  esac
+
+  # --require-checksum exists so that a caller which is not a human reading
+  # warnings can insist on verification. A ref install has nothing to verify
+  # against, so accepting both would make the flag quietly meaningless.
+  if [ -n "$OPT_REF" ] && [ "$OPT_REQUIRE_CHECKSUM" = "yes" ]; then
+    die "--require-checksum cannot be used with --ref: ref installs are unverified"
+  fi
+
+  # --modify-path writes this value into a shell startup file, inside double
+  # quotes, and both branches of report_path_situation put it in front of the
+  # user. Anything that could close that quote is arbitrary code in every login
+  # shell from then on. Spaces are fine; shell metacharacters are not.
+  nl='
+'
+  case "$OPT_PREFIX" in
+  '') ;;
+  *[\"\$\`\\]* | *"'"* | *"$nl"*)
+    die "invalid --prefix: must not contain quotes, \$, backticks, backslashes or newlines"
+    ;;
   esac
 
   if [ "$OPT_UNINSTALL" = "yes" ]; then

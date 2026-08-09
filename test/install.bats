@@ -280,6 +280,40 @@ run_installer() {
   [ ! -e "$CURL_LOG" ]
 }
 
+# --modify-path writes the prefix into a shell startup file inside double
+# quotes, and both branches of report_path_situation show it to the user.
+# Anything able to close that quote is arbitrary code in every login shell from
+# then on, which this proves is rejected before it can be written.
+@test "--prefix rejects values that could break out of the shell rc line" {
+  local bad
+  for bad in '/tmp/x";touch /tmp/pwned;echo "' '/tmp/$(id)' '/tmp/`id`' '/tmp/a\b' "/tmp/it's"; do
+    stub_logging_curl
+    run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --modify-path --prefix "$bad"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"invalid --prefix"* ]]
+    [ ! -e "$CURL_LOG" ]
+  done
+}
+
+@test "--prefix still accepts an ordinary path containing spaces" {
+  stub_release_curl
+  real_sums
+  run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --version 0.2.2 --prefix "${TESTDIR}/my bin"
+  [ "$status" -eq 0 ]
+  [ -x "${TESTDIR}/my bin/claude-work" ]
+}
+
+# A flag whose whole purpose is "fail rather than warn when verification is
+# impossible" must never be silently inert. --ref installs are unverified by
+# design, so the combination is refused rather than ignored.
+@test "--require-checksum refuses to be combined with --ref" {
+  stub_logging_curl
+  run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --require-checksum --ref main --prefix "${TESTDIR}/out"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot be used with --ref"* ]]
+  [ ! -e "$CURL_LOG" ]
+}
+
 @test "a plain version is accepted and does reach the download" {
   stub_logging_curl
   run_installer --version 0.2.2
