@@ -89,7 +89,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install from this commit
-        run: sh install.sh --ref "${GITHUB_SHA}" --prefix "${RUNNER_TEMP}/bin"
+        run: |
+          set -euo pipefail
+          sh install.sh --ref "${GITHUB_SHA}" --prefix "${RUNNER_TEMP}/bin" 2>&1 |
+            tee "${RUNNER_TEMP}/install.log"
+      # The runners have git but not claude, which is exactly the situation that
+      # used to produce "Install git and tmux with: brew install git tmux".
+      - name: Dependency hints name only the tools that are missing
+        run: |
+          set -euo pipefail
+          log=$(cat "${RUNNER_TEMP}/install.log")
+          case "$log" in
+            *"claude.com/claude-code"*) ;;
+            *) echo "::error::installer did not point at Claude Code"; exit 1 ;;
+          esac
+          case "$log" in
+            *"install git"*)
+              echo "::error::installer suggested installing git, which is present"
+              exit 1
+              ;;
+          esac
       - name: Installed command runs
         run: |
           set -euo pipefail

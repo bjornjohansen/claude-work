@@ -130,6 +130,43 @@ rc_file() {
   esac
 }
 
+# True if $1 exists as an executable in one of the system binary directories.
+# Deliberately not `have`: PATH is user-controlled, and the caller uses this to
+# decide the text of a sudo command.
+system_bin() {
+  # /usr/local/bin is intentionally absent: it is frequently user-writable —
+  # this installer writes there without sudo when it can.
+  for d in /usr/bin /bin /usr/sbin /sbin; do
+    [ -x "${d}/$1" ] && return 0
+  done
+  return 1
+}
+
+# Echo the command that installs the given packages ($1, space separated) with
+# the system package manager, or nothing if we have no sensible suggestion.
+pkg_install_cmd() {
+  case "$(uname -s)" in
+  Darwin) printf 'brew install %s\n' "$1" ;;
+  Linux)
+    # Probed at absolute paths rather than through PATH: this text is a command
+    # we are asking someone to paste into a root shell, so a stray executable
+    # named "dnf" in a writable PATH directory must not get to choose it.
+    #
+    # apt is the fallback rather than a probe: it covers Debian/Ubuntu, which is
+    # the common case, and a wrong-but-obvious hint beats no hint at all.
+    if system_bin dnf; then
+      printf 'sudo dnf install %s\n' "$1"
+    elif system_bin pacman; then
+      printf 'sudo pacman -S %s\n' "$1"
+    elif system_bin zypper; then
+      printf 'sudo zypper install %s\n' "$1"
+    else
+      printf 'sudo apt install %s\n' "$1"
+    fi
+    ;;
+  esac
+}
+
 resolve_target_dir() {
   if [ -n "$OPT_PREFIX" ]; then
     printf '%s\n' "$OPT_PREFIX"
@@ -142,21 +179,59 @@ resolve_target_dir() {
 
 # --- actions --------------------------------------------------------------
 
+# Under sudo the probes below see root's PATH, not the invoking user's, so a
+# per-user install of claude (npm, nvm, ~/.local/bin) looks missing when it is
+# not. Say so rather than sending the user off to reinstall something they have.
+root_path_note() {
+  [ "$(id -u)" = "0" ] || return 0
+  [ -n "${SUDO_USER:-}" ] || return 0
+
+  # SUDO_USER is an ordinary environment variable, not a fact. Anything that is
+  # not shaped like a username is not echoed back: it could otherwise smuggle
+  # terminal escapes into output that elsewhere carries lines like
+  # "checksum mismatch".
+  case "$SUDO_USER" in
+  *[!A-Za-z0-9._-]*) who="the invoking user" ;;
+  *) who="$SUDO_USER" ;;
+  esac
+
+  info ""
+  info "  Note: this check ran as root, so tools installed for ${who} may not"
+  info "  be visible here. If they work in your own shell, you can ignore this."
+}
+
+# Only ever give instructions for the tools that are actually missing — telling
+# someone to install git when git is present is how this message gets misread.
 check_runtime_deps() {
   missing=""
+  pkgs=""
   for dep in git tmux claude; do
-    have "$dep" || missing="${missing} ${dep}"
+    have "$dep" && continue
+    missing="${missing}${missing:+ }${dep}"
+    # git and tmux come from the system package manager; claude does not.
+    case "$dep" in
+    git | tmux) pkgs="${pkgs}${pkgs:+ }${dep}" ;;
+    esac
   done
   [ -z "$missing" ] && return 0
 
-  warn "${BIN_NAME} needs these at runtime, and they are not on your PATH:${missing}"
-  case "$(uname -s)" in
-  Darwin) info "  Install git and tmux with:  brew install git tmux" ;;
-  Linux) info "  Install git and tmux with:  sudo apt install git tmux" ;;
-  esac
   case "$missing" in
-  *claude*) info "  Install Claude Code from:   https://claude.com/claude-code" ;;
+  *" "*) warn "${BIN_NAME} needs these at runtime, but they are not on your PATH: ${missing}" ;;
+  *) warn "${BIN_NAME} needs ${missing} at runtime, but it is not on your PATH." ;;
   esac
+
+  if [ -n "$pkgs" ]; then
+    cmd=$(pkg_install_cmd "$pkgs")
+    [ -n "$cmd" ] && info "  Install with:             ${cmd}"
+  fi
+
+  # Delimited match, so this cannot be triggered by some other dep whose name
+  # merely contains "claude".
+  case " ${missing} " in
+  *" claude "*) info "  Install Claude Code from: https://claude.com/claude-code" ;;
+  esac
+
+  root_path_note
 }
 
 do_uninstall() {
