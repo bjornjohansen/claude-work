@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `install.sh` did not validate `--version` or `--ref` before interpolating them into the download
+  URL. curl resolves `../` in a path before sending the request, so a crafted value moved the
+  download to an entirely different repository — and because the artifact and `SHA256SUMS` are
+  fetched from the same base, both moved together and the installer reported `Checksum verified.`
+  for an attacker-supplied file. Both options are now restricted to a safe character set with no
+  `..`, and rejected before any request is made.
+- `install.sh` treated a malformed or empty `SHA256SUMS` as verified. The verdict came from
+  `sha*sum -c`, whose exit status is not usable for this: on macOS's `/sbin/sha256sum` an
+  improperly formatted checksum line exits 0 with only a warning on stderr, which `sha_check`
+  discarded, and an empty checksum file exits 0 as well. Both are what a truncated or tampered
+  download looks like. The installer now requires a full 64-character hex entry for the file it
+  actually downloaded and compares the hashes itself.
+
+### Added
+
+- `install.sh --require-checksum` fails instead of warning when no `sha256sum` or `shasum` is
+  available to verify the download.
+- `install.sh` is now published as a release asset and covered by `SHA256SUMS`, so it can be
+  verified before it is run.
+
+### Fixed
+
+- `install.sh` replaced the installed command with `install`, which unlinks and recreates the
+  target. That leaves a window where the command does not exist, and then one where it exists but
+  is incompletely written; a concurrent `claude-work` can hit either. It now stages the new file
+  under an unpredictable name in the target directory and renames it into place, which is atomic
+  and lets an already-running copy keep reading the version it started with.
+- `install.sh --uninstall` left the update-check cache behind.
+
 ## [0.2.2] - 2026-08-09
 
 ### Fixed

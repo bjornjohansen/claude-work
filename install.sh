@@ -56,6 +56,9 @@ Options:
                     For testing unreleased code — skips checksum verification.
   --prefix DIR      Install into DIR (default: /usr/local/bin if writable,
                     otherwise \$HOME/.local/bin)
+  --require-checksum
+                    Fail instead of warning when no sha256sum/shasum is
+                    available to verify the download
   --modify-path     Append the install dir to your shell rc file if it is not
                     already on PATH. Off by default.
   --uninstall       Remove an installed ${BIN_NAME} and exit
@@ -90,12 +93,19 @@ download() {
   fi
 }
 
-# sha256sum on Linux, shasum on macOS. Both read the same checksum format.
-sha_check() {
+# Echo the SHA-256 of $1 as bare lowercase hex. sha256sum on Linux, shasum on
+# macOS; both print "<hash>  <name>". Returns 2 when neither exists.
+#
+# Deliberately not `sha*sum -c`: its exit status is not a usable verdict. On
+# macOS's /sbin/sha256sum a malformed checksum line exits 0 with only a warning
+# on stderr ("1 line is improperly formatted"), and an empty checksum file also
+# exits 0 — so a truncated or tampered SHA256SUMS would read as verified.
+# Comparing the hashes ourselves has one meaning and no such edge.
+sha256_of() {
   if have sha256sum; then
-    sha256sum -c "$1" >/dev/null 2>&1
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
   elif have shasum; then
-    shasum -a 256 -c "$1" >/dev/null 2>&1
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
   else
     return 2
   fi
@@ -257,6 +267,20 @@ do_uninstall() {
   done
   set +f
   IFS=$old_ifs
+
+  # The tool caches its update check here. Leaving it behind would make an
+  # uninstall/reinstall cycle look like it remembered a declined upgrade.
+  cache_dir="${XDG_CACHE_HOME:-}"
+  case "$cache_dir" in /*) ;; *) cache_dir="${HOME:-}/.cache" ;; esac
+  cache_dir="${cache_dir}/${BIN_NAME}"
+  if [ -n "${HOME:-}" ] && [ -d "$cache_dir" ] && [ ! -L "$cache_dir" ]; then
+    if [ "$OPT_DRY_RUN" = "yes" ]; then
+      info "Would remove ${cache_dir}"
+    else
+      rm -rf "$cache_dir" 2>/dev/null && info "Removed ${cache_dir}"
+    fi
+  fi
+
   [ -n "$found" ] || info "No installed ${BIN_NAME} found."
 }
 
@@ -295,11 +319,13 @@ warn_if_shadowed() {
 }
 
 fetch_binary() {
-  dest="$1"
+  # Not `dest`: this is POSIX sh with no `local`, and download() assigns a
+  # global `dest` of its own, so that name is clobbered by the calls below.
+  bin_path="$1"
 
   if [ -n "$OPT_REF" ]; then
     warn "installing from ref '${OPT_REF}' — checksum verification is skipped"
-    download "${RAW_BASE}/${OPT_REF}/bin/${BIN_NAME}" "$dest" ||
+    download "${RAW_BASE}/${OPT_REF}/bin/${BIN_NAME}" "$bin_path" ||
       die "could not download ${BIN_NAME} at ref ${OPT_REF}"
     return 0
   fi
@@ -310,7 +336,7 @@ fetch_binary() {
     base="${RELEASE_BASE}/latest/download"
   fi
 
-  download "${base}/${BIN_NAME}" "$dest" ||
+  download "${base}/${BIN_NAME}" "$bin_path" ||
     die "could not download ${BIN_NAME} from ${base}"
 
   sums="${TMPDIR_CW}/SHA256SUMS"
@@ -318,19 +344,33 @@ fetch_binary() {
     die "could not download SHA256SUMS from ${base} — refusing to install unverified"
   fi
 
-  # sha*sum -c resolves filenames relative to the working directory.
+  # SHA256SUMS covers every published asset, so pick out our own line. The hash
+  # must be exactly 64 hex characters: a short or malformed field is the shape a
+  # truncated download takes, and it must never reach the comparison as
+  # something that happens to be equal to a truncated computed value. Anchored
+  # on the exact name so a future asset like "claude-work.sig" cannot be the one
+  # that gets checked.
+  expected=$(sed -n "s/^\([0-9a-f]\{64\}\)  ${BIN_NAME}\$/\1/p" "$sums" | head -n 1)
+  [ -n "$expected" ] ||
+    die "SHA256SUMS from ${base} has no usable entry for ${BIN_NAME}"
+
   # `|| rc=$?` keeps this a condition context, so `set -e` cannot abort us
-  # before the mismatch message below is printed.
+  # before the message below is printed.
   rc=0
-  (
-    cd "$TMPDIR_CW" || exit 1
-    sha_check SHA256SUMS
-  ) || rc=$?
-  case $rc in
-  0) info "Checksum verified." ;;
-  2) warn "no sha256sum or shasum available — could not verify the download" ;;
-  *) die "checksum mismatch — refusing to install ${BIN_NAME}" ;;
-  esac
+  actual=$(sha256_of "$bin_path") || rc=$?
+  if [ "$rc" = "2" ]; then
+    # Failing open is a deliberate choice for a human-driven install: the user
+    # sees the warning and decides. It is the wrong choice when something else
+    # invoked us (claude-work --upgrade), where the warning just scrolls past.
+    [ "$OPT_REQUIRE_CHECKSUM" = "no" ] ||
+      die "no sha256sum or shasum available — cannot verify the download"
+    warn "no sha256sum or shasum available — could not verify the download"
+    return 0
+  fi
+
+  [ -n "$actual" ] && [ "$actual" = "$expected" ] ||
+    die "checksum mismatch — refusing to install ${BIN_NAME}"
+  info "Checksum verified."
 }
 
 install_binary() {
@@ -359,8 +399,22 @@ install_binary() {
 
   mkdir -p "$target_dir" 2>/dev/null ||
     die "could not create ${target_dir}"
-  install -m 0755 "$src" "$target" 2>/dev/null ||
-    die "could not write ${target} — try 'sudo sh install.sh' or --prefix DIR"
+
+  # Stage beside the target and rename over it. `install` would do the job, but
+  # it unlinks and recreates, which leaves a window where the command is missing
+  # and then a window where it exists but is incompletely written — a concurrent
+  # claude-work can hit either. rename(2) is atomic and lets an already-running
+  # copy keep reading its old inode.
+  #
+  # mktemp, not a "${target}.new.$$" style name: a predictable path in a
+  # directory someone else can write is a symlink target they can plant, and
+  # then the copy below writes through it as whoever ran this script.
+  tmp=$(mktemp "${target_dir}/.${BIN_NAME}.XXXXXX" 2>/dev/null) ||
+    die "could not write to ${target_dir} — try 'sudo sh ${0}' or --prefix DIR"
+  if ! (cat "$src" >"$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$target") 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    die "could not write ${target} — try 'sudo sh ${0} --prefix \"${target_dir}\"'"
+  fi
 
   info "Installed ${target}"
   report_path_situation "$target_dir"
@@ -376,6 +430,7 @@ main() {
   OPT_MODIFY_PATH="no"
   OPT_UNINSTALL="no"
   OPT_DRY_RUN="no"
+  OPT_REQUIRE_CHECKSUM="no"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -398,6 +453,10 @@ main() {
       OPT_MODIFY_PATH="yes"
       shift
       ;;
+    --require-checksum)
+      OPT_REQUIRE_CHECKSUM="yes"
+      shift
+      ;;
     --uninstall)
       OPT_UNINSTALL="yes"
       shift
@@ -417,6 +476,21 @@ main() {
   if [ -n "$OPT_VERSION" ] && [ -n "$OPT_REF" ]; then
     die "--version and --ref are mutually exclusive"
   fi
+
+  # Both values are interpolated into the download URL, and curl resolves "../"
+  # in a path before sending the request — so an unvalidated value does not just
+  # pick a different file, it picks a different *repository*. Because the
+  # artifact and SHA256SUMS are fetched from the same base, both move together
+  # and the checksum would then verify an attacker's file against an attacker's
+  # checksum. Restrict the charset and forbid "..".
+  case "${OPT_VERSION#v}" in
+  '') ;;
+  *[!0-9.]* | *..*) die "invalid --version: expected X.Y.Z" ;;
+  esac
+  case "$OPT_REF" in
+  '') ;;
+  *[!A-Za-z0-9._/-]* | *..*) die "invalid --ref: expected a branch, tag or SHA" ;;
+  esac
 
   if [ "$OPT_UNINSTALL" = "yes" ]; then
     do_uninstall
