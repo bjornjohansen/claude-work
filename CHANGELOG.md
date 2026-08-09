@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-09
+
+### Security
+
+- `install.sh` did not validate `--version` or `--ref` before interpolating them into the download
+  URL. curl resolves `../` in a path before sending the request, so a crafted value moved the
+  download to an entirely different repository — and because the artifact and `SHA256SUMS` are
+  fetched from the same base, both moved together and the installer reported `Checksum verified.`
+  for an attacker-supplied file. Both options are now restricted to a safe character set with no
+  `..`, and rejected before any request is made.
+- `install.sh --modify-path` wrote the `--prefix` value into a shell startup file inside double
+  quotes, without validating it. A prefix containing a quote closed the string and left the rest as
+  commands, executed by every login shell from then on — and `--prefix` can also come from the
+  `CLAUDE_WORK_INSTALL_DIR` environment variable. The same unvalidated value was printed as
+  copy-paste instructions in the other branch. Prefixes containing quotes, `$`, backticks,
+  backslashes or newlines are now rejected; ordinary paths with spaces still work.
+- `install.sh --require-checksum` was silently ignored when combined with `--ref`, because ref
+  installs return before verification is reached. A flag that exists to turn an unverifiable
+  download into a failure must never be inert, so the combination is now refused.
+- `install.sh` treated a malformed or empty `SHA256SUMS` as verified. The verdict came from
+  `sha*sum -c`, whose exit status is not usable for this: on macOS's `/sbin/sha256sum` an
+  improperly formatted checksum line exits 0 with only a warning on stderr, which `sha_check`
+  discarded, and an empty checksum file exits 0 as well. Both are what a truncated or tampered
+  download looks like. The installer now requires a full 64-character hex entry for the file it
+  actually downloaded and compares the hashes itself.
+
+### Added
+
+- `claude-work` now notices when a newer release exists and says so as your session ends. The
+  lookup runs in a detached background process started after preflight, so startup is not delayed —
+  under 1 ms, against the ~15 ms `git worktree prune` spends moments later. It happens at most once
+  a day, never when stdin/stderr is not a terminal or `$CI` is set, and is disabled by any of
+  `CLAUDE_WORK_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` or `DO_NOT_TRACK`. One HTTPS request to
+  github.com with no custom `User-Agent`, no cookies and the response body discarded. Declining an
+  upgrade is remembered, so the same version is not offered again.
+  The notice appears when the work is finished; detaching from a session never prompts.
+- `claude-work --upgrade` replaces the running copy in place. It downloads `install.sh` from the
+  latest release, verifies it against that release's `SHA256SUMS` before running it, and installs
+  into the directory the running copy already occupies. It refuses to touch a copy inside a git
+  checkout. See the README for what that trust does and does not cover.
+- `claude-work --version` (also `-V`). Previously this failed with a message about slugs.
+- `install.sh --require-checksum` fails instead of warning when no `sha256sum` or `shasum` is
+  available to verify the download.
+- `install.sh` is now published as a release asset and covered by `SHA256SUMS`, so it can be
+  verified before it is run.
+- A weekly workflow checks that the `releases/latest` redirect still has the shape the update check
+  depends on. Every failure mode in the check is deliberately silent, so without this a rename or a
+  changed redirect would disable it for everyone with nothing to show for it.
+
+### Fixed
+
+- `install.sh` replaced the installed command with `install`, which unlinks and recreates the
+  target. That leaves a window where the command does not exist, and then one where it exists but
+  is incompletely written; a concurrent `claude-work` can hit either. It now stages the new file
+  under an unpredictable name in the target directory and renames it into place, which is atomic
+  and lets an already-running copy keep reading the version it started with.
+- `install.sh --uninstall` left the update-check cache behind.
+
 ## [0.2.2] - 2026-08-09
 
 ### Fixed
@@ -86,7 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GIT_REMOTE` and `BRANCH_PREFIX` environment variables.
 - Offline fallback to the local base branch, with a warning, when the remote cannot be fetched.
 
-[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bjornjohansen/claude-work/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/bjornjohansen/claude-work/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bjornjohansen/claude-work/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bjornjohansen/claude-work/compare/v0.1.0...v0.2.0

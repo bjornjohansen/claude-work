@@ -2,10 +2,12 @@
 #
 # claude-work — spin up a git worktree + tmux session + Claude Code for one issue
 #
-# Version: 0.2.2
+# Version: 0.3.0
 #
 # Usage:
 #   claude-work <issue-slug> [base-branch]
+#   claude-work --version
+#   claude-work --upgrade
 #
 # Example:
 #   claude-work issue-123
@@ -14,6 +16,16 @@
 # Environment:
 #   GIT_REMOTE     Remote to fetch the base branch from (default: origin)
 #   BRANCH_PREFIX  Prefix for the created branch     (default: fix)
+#
+#   CLAUDE_WORK_NO_UPDATE_CHECK   Set to anything to disable the update check.
+#                                 NO_UPDATE_NOTIFIER and DO_NOT_TRACK also work.
+#   CLAUDE_WORK_UPDATE_INTERVAL   Seconds between checks (default: 86400)
+#   CLAUDE_WORK_UPDATE_DEBUG      Set to report why a check found nothing
+#
+# The update check makes one HTTPS request to github.com at most once a day,
+# in the background, and never when stdin/stderr is not a terminal or $CI is
+# set. Nothing about you is sent: no custom User-Agent, no cookies, and the
+# response body is discarded.
 #
 # What it does:
 #   1. Creates a new worktree at ../<repo>-<issue-slug>
@@ -32,6 +44,20 @@ SLUG="${1:-}"
 BASE_BRANCH="${2:-main}"
 REMOTE="${GIT_REMOTE:-origin}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-fix}"
+
+# Where this script lives, resolved before anything cd's away (step 1 below cd's
+# to the repo root, after which a relative $0 would be wrong). $PWD is a shell
+# variable, so this costs no forks — it runs on every invocation. Symlinks are
+# deliberately left unresolved here; only the upgrade path cares, and that can
+# afford the forks.
+CW_SELF="${BASH_SOURCE[0]}"
+case "$CW_SELF" in /*) ;; *) CW_SELF="${PWD}/${CW_SELF}" ;; esac
+
+# Set here rather than only where they are raised, so that inheriting either
+# from the environment cannot decide our behaviour — _CW_SESSION_ENDED in
+# particular is what allows the exit trap to ask a question.
+_CW_QUIET=""
+_CW_SESSION_ENDED=""
 
 # --- Helpers ---
 
@@ -112,12 +138,505 @@ attach_session() {
   if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$1"
     echo "Switched to ${1}. (Already inside tmux — cleanup prompt skipped.)"
+    # switch-client moves the user's attention to another session, so anything
+    # the exit trap printed here would land on a pane they have just left.
+    _CW_QUIET=1
     exit 0
   fi
   tmux attach-session -t "$1"
 }
 
+# --- update check begin ---
+#
+# Look up the latest release in the background and say so when the session ends.
+#
+# Two facts drive the shape of this. The check costs ~340ms of network, and
+# startup must stay free — so nothing here blocks: one detached fork (~0.4ms)
+# and the foreground moves on. And a notice printed at startup is invisible,
+# because tmux takes the alternate screen a few milliseconds later; the moments
+# the user can actually read are the ones where the tool hands control back.
+# Firing at startup and reading at exit also means the answer is current for
+# *this* run, since the tmux session gives the fetch minutes to hours of slack.
+#
+# The cache is untrusted input, on the same footing as the network response.
+# Writing one small file under ~/.cache is a primitive nothing flags, and it
+# feeds a URL, an arithmetic expression and the terminal — so every field is
+# re-validated on read, in cw_cache_read, and nothing here ever uses `source`
+# or `eval`.
+
+# Hardcoded on purpose. No environment variable may point the check at another
+# host: that would be a tidy foothold for anyone who can set one.
+CW_RELEASES_LATEST_URL="https://github.com/bjornjohansen/claude-work/releases/latest"
+CW_RELEASE_TAG_PREFIX="https://github.com/bjornjohansen/claude-work/releases/tag/v"
+# Note there is no version in this one either. The cached version is never
+# interpolated into a URL: curl resolves "../" in a path before sending, so a
+# cache someone else can write would otherwise choose the repository we
+# download from.
+CW_LATEST_DOWNLOAD_URL="https://github.com/bjornjohansen/claude-work/releases/latest/download"
+
+# Echo this script's own version, or fail if it cannot be established.
+#
+# The header comment is the single source of truth — install.sh, the CI version
+# check and scripts/bump-version.sh all read it with this same expression. A
+# `CW_VERSION=` constant would be a fourth copy to keep in step, for no gain:
+# nothing on the startup path needs the version, so one sed is affordable here.
+# Fails under `curl ... | bash`, where there is no file to read.
+cw_own_version() {
+  local v
+  v=$(sed -n 's/^# Version:[[:space:]]*//p' "$CW_SELF" 2>/dev/null | head -n 1)
+  case "$v" in '' | *[!0-9.]*) return 1 ;; esac
+  printf '%s\n' "$v"
+}
+
+# The one authority on what a version may look like. Anchored and length-bound.
+# Rejecting "1.2.3-rc1" is deliberate: prereleases must never nag.
+cw_is_semver() {
+  case "${1:-}" in '' | -) return 1 ;; esac
+  [[ "$1" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]
+}
+
+# Echo the cache file path, or fail when there is nowhere usable to keep it.
+# Both the writer and the reader go through here, so they cannot disagree about
+# where the file lives — a disagreement would be silent and harmless-looking.
+cw_cache_file() {
+  local d="${XDG_CACHE_HOME:-}"
+  case "$d" in
+  /*) ;;
+  *)
+    # A relative XDG_CACHE_HOME would resolve against the caller's cwd, which by
+    # this point is the user's repository. Ignore it rather than litter there.
+    [ -n "${HOME:-}" ] || return 1
+    d="${HOME}/.cache"
+    ;;
+  esac
+  d="${d}/claude-work"
+  if [ ! -d "$d" ]; then
+    mkdir -p "$d" 2>/dev/null || return 1
+    # Only our own directory, not the parent: with -p, -m would apply to the
+    # deepest one anyway, and chmodding someone's ~/.cache is not our business.
+    chmod 0700 "$d" 2>/dev/null || :
+  fi
+  # Someone else's directory is someone else's content.
+  [ ! -L "$d" ] && [ -O "$d" ] || return 1
+  printf '%s\n' "${d}/update"
+}
+
+# Load the cache into CW_CHECKED / CW_LATEST / CW_DECLINED, which are always
+# left with safe values whether or not there was anything to read.
+#
+# Three fields, no schema version: if the format ever changes, change the
+# filename instead and old files are ignored by construction.
+cw_cache_read() {
+  local f c l d
+  CW_CHECKED=0
+  CW_LATEST=-
+  CW_DECLINED=-
+
+  f=$(cw_cache_file) || return 1
+
+  # -f is what stops `read` from blocking forever on a fifo, and it stays false
+  # through a symlink to one. It is *not* enough on its own: -f follows a
+  # symlink to a regular file, so an attacker-planted link would be read
+  # happily. Hence -L and -O as well.
+  [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ] && [ -r "$f" ] || return 0
+
+  # `read` reports failure on a last line with no newline but still assigns.
+  read -r c l d <"$f" || :
+
+  # Default first, then validate the value we are actually keeping — testing
+  # "${c:-0}" while assigning to $c would leave an empty field empty.
+  #
+  # A non-numeric value reaching $(( )) is command execution: arithmetic
+  # evaluates array subscripts, so "x[0$(...)]" runs what is inside. This case
+  # is the only thing between a writable cache file and a shell.
+  c="${c:-0}"
+  case "$c" in '' | *[!0-9]*) c=0 ;; esac
+  # Digits alone are not enough to be a safe arithmetic operand: "0999990" is
+  # read as octal and errors out, and an absurdly long run of digits overflows.
+  # Either would abort the staleness test and make the check refetch on every
+  # single run. Bound the length, then normalise base 10.
+  [ "${#c}" -le 12 ] || c=0
+  c=$((10#$c))
+  cw_is_semver "${l:-}" || l=-
+  cw_is_semver "${d:-}" || d=-
+
+  CW_CHECKED="$c"
+  CW_LATEST="$l"
+  CW_DECLINED="$d"
+}
+
+# Replace the cache atomically: same directory, so mv is rename(2) and a
+# concurrent reader sees either the old file or the new one, never a partial.
+# Never fails the caller — a cache we cannot write is not worth an error.
+cw_cache_write() {
+  local f t
+  f=$(cw_cache_file) || return 0
+  t=$(mktemp "${f%/*}/.update.XXXXXX" 2>/dev/null) || return 0
+  if printf '%s %s %s\n' "$1" "$2" "$3" >"$t" 2>/dev/null &&
+    mv -f "$t" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$t" 2>/dev/null || :
+  return 0
+}
+
+# The body of the background check. Runs detached; its only output is the cache.
+cw_update_fetch() {
+  local now interval url tag
+
+  now=$(date +%s) || return 0
+  case "$now" in '' | *[!0-9]*) return 0 ;; esac
+
+  interval="${CLAUDE_WORK_UPDATE_INTERVAL:-86400}"
+  case "$interval" in '' | *[!0-9]*) interval=86400 ;; esac
+
+  cw_cache_read || return 0
+
+  # A stamp in the future means the clock moved, not that we just checked —
+  # treating it as fresh would disable the check until the date caught up.
+  if [ "$CW_CHECKED" -le "$now" ] && [ $((now - CW_CHECKED)) -lt "$interval" ]; then
+    return 0
+  fi
+
+  # Stamp before fetching, not after. Without this, a machine that is offline
+  # retries on every single run; with it, one failed attempt costs one attempt
+  # per interval. Keeping the known version means a failure never erases it.
+  cw_cache_write "$now" "$CW_LATEST" "$CW_DECLINED"
+
+  # No -L: one request, one 302, an empty body. github.com's redirect is used
+  # rather than api.github.com because the API allows 60 requests an hour per
+  # source IP, shared with every other unauthenticated caller behind the same
+  # NAT — which would break the check for exactly the users most likely to be
+  # running something old. No --retry: a failure waits for the next interval,
+  # rather than turning a GitHub outage into a stampede. No custom User-Agent
+  # and no cookie jar, deliberately: either would turn an ambient request into
+  # something that identifies the caller across runs.
+  url=$(curl -fs \
+    --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 8 \
+    -o /dev/null -w '%{redirect_url}' \
+    "$CW_RELEASES_LATEST_URL") || return 0
+
+  # Debug output goes to a real terminal, and this string came off the wire —
+  # a Location header carrying escape sequences must not be replayed into the
+  # user's pane just because they asked why the check found nothing.
+  if [ -n "${CLAUDE_WORK_UPDATE_DEBUG:-}" ]; then
+    case "$url" in
+    *[!A-Za-z0-9:/._~%?\#=-]*) echo "claude-work: redirect_url=(unprintable)" >&2 ;;
+    *) echo "claude-work: redirect_url=${url}" >&2 ;;
+    esac
+  fi
+
+  # Match the whole expected prefix, not just the shape of the tail: captive
+  # portals answer with a 302 of their own, and a semver check alone would
+  # happily accept the version out of one. If the repository is ever renamed
+  # this stops matching and the check goes quiet, which is the right direction
+  # to fail.
+  case "$url" in
+  "$CW_RELEASE_TAG_PREFIX"*) tag=${url#"$CW_RELEASE_TAG_PREFIX"} ;;
+  *) return 0 ;;
+  esac
+  cw_is_semver "$tag" || return 0
+
+  cw_cache_write "$now" "$tag" "$CW_DECLINED"
+}
+
+# True if $1 is a strictly newer version than $2.
+#
+# Strictly, so a maintainer running a build ahead of the latest release is never
+# told to downgrade to it. Not `sort -V`, which BSD sort cannot be relied on to
+# have; and not a here-string, which bash 3.2 implements with a temporary file.
+cw_version_gt() {
+  local a="$1" b="$2"
+  local IFS=. i x y
+  local -a n c
+
+  # Both arguments must be captured before the first `set --`, which replaces
+  # the positional parameters this function was called with. Globbing is off
+  # for the same two lines: IFS controls splitting, not expansion, and these
+  # run with the repository as the working directory.
+  set -f
+  # shellcheck disable=SC2086 # splitting on IFS=. is exactly the intent
+  set -- $a
+  n=("$@" 0 0 0)
+  # shellcheck disable=SC2086
+  set -- $b
+  c=("$@" 0 0 0)
+  set +f
+
+  for i in 0 1 2; do
+    # 10# alone is not a safety measure — it fixes "08" being read as octal, but
+    # $(( )) still evaluates command substitutions and array subscripts, so
+    # "0,a[0$(...)]" would run. Callers pass cw_is_semver values; this is the
+    # backstop for the day one of them forgets.
+    case "${n[i]:-0}${c[i]:-0}" in *[!0-9]*) return 1 ;; esac
+    x=$((10#${n[i]:-0}))
+    y=$((10#${c[i]:-0}))
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+  done
+  return 1
+}
+
+# Say a word about a newer release, on the way out.
+#
+# Installed as an EXIT trap rather than called from each of the script's exit
+# points, so it is always the last thing printed and cannot be forgotten when
+# someone adds another exit. It is installed after the preflight, so the usage
+# and missing-dependency paths stay silent — telling someone about a new
+# version while explaining that tmux is missing is just noise.
+_cw_on_exit() {
+  _CW_RC=$?
+  # The shell is already on its way out. Without this, one stray non-zero would
+  # both abandon the rest of the handler and silently turn a successful session
+  # into `exit 1` for anything scripting this tool.
+  set +e
+
+  [ "$_CW_RC" -eq 0 ] || return 0
+  [ -z "${_CW_QUIET:-}" ] || return 0
+  [ -z "${CLAUDE_WORK_NO_UPDATE_CHECK:-}" ] || return 0
+  [ -z "${NO_UPDATE_NOTIFIER:-}" ] || return 0
+  [ -z "${DO_NOT_TRACK:-}" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  [ -t 2 ] || return 0
+
+  cw_cache_read || return 0
+  [ "$CW_LATEST" = "-" ] && return 0
+  # Asked once and declined: do not ask again for that version. Without this the
+  # notice reappears on every run until the user upgrades, which is how a
+  # helpful message turns into one people permanently switch off.
+  [ "$CW_DECLINED" = "$CW_LATEST" ] && return 0
+
+  local mine
+  mine=$(cw_own_version) || return 0
+  cw_version_gt "$CW_LATEST" "$mine" || return 0
+
+  # stderr, so it survives `claude-work foo > log` and stays out of anything
+  # reading this tool's output. Both versions are named: "a new version is
+  # available" without saying which is a message people learn to ignore.
+  echo >&2
+  echo "claude-work ${CW_LATEST} is available (you have ${mine})" >&2
+  echo "  ${CW_RELEASE_TAG_PREFIX}${CW_LATEST}" >&2
+
+  # Only offer to do it when the session has actually finished. On the detach
+  # path the user has stepped away mid-task and expects their shell back
+  # immediately; a blocking question there is the one regression that would
+  # make this feature worse than nothing.
+  if [ -n "${_CW_SESSION_ENDED:-}" ] && [ -t 0 ]; then
+    cw_offer_upgrade
+  else
+    echo "  Upgrade with: claude-work --upgrade" >&2
+  fi
+  return 0
+}
+
+# Discard anything typed before the prompt was printed, so a "y" aimed at the
+# cleanup confirmation a moment earlier is not read as consent to fetch and run
+# code. bash 3.2's `read -t 0` cannot report pending input — it returns failure
+# even when there is some — so this is best effort there and costs nothing.
+# The prompt defaults to no either way.
+# shellcheck disable=SC2034 # `junk` is read into deliberately and never used
+cw_drain_input() {
+  local junk i=0
+  while [ "$i" -lt 100 ] && read -r -t 0 junk 2>/dev/null; do
+    read -r -t 1 junk 2>/dev/null || break
+    i=$((i + 1))
+  done
+  return 0
+}
+
+cw_offer_upgrade() {
+  cw_drain_input
+  if confirm "Upgrade claude-work to ${CW_LATEST} now?"; then
+    # A failed upgrade reports itself and is deliberately not propagated: the
+    # session did its job, and turning that into a non-zero exit would break
+    # anything scripting this tool over an optional extra that was offered
+    # rather than asked for. `claude-work --upgrade` does propagate it.
+    cw_do_upgrade || :
+    return 0
+  fi
+  # Remember the refusal, but keep the existing timestamp so declining does not
+  # also reset the check interval.
+  cw_cache_write "$CW_CHECKED" "$CW_LATEST" "$CW_LATEST"
+  echo "Left alone. Run 'claude-work --upgrade' whenever you like." >&2
+  return 0
+}
+
+# Echo the SHA-256 of $1 as bare hex, or return 2 when nothing can compute it.
+cw_sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    return 2
+  fi
+}
+
+# Echo the directory holding the real script, following symlinks. Bounded, so a
+# symlink loop cannot spin. Only the upgrade path needs this, which is why the
+# forks it costs are acceptable — startup resolves nothing.
+cw_self_dir() {
+  local p="$CW_SELF" t i=0
+  while [ -L "$p" ] && [ "$i" -lt 20 ]; do
+    t=$(readlink "$p") || break
+    case "$t" in
+    /*) p="$t" ;;
+    *) p="$(dirname "$p")/$t" ;;
+    esac
+    i=$((i + 1))
+  done
+  (cd "$(dirname "$p")" 2>/dev/null && pwd -P)
+}
+
+# Fetch the published installer, check it, and let it do the work. Returns
+# rather than exits: it has two callers, and depending on either one's state
+# would make it wrong for the other.
+cw_do_upgrade() {
+  local dir tmpd rc
+
+  # `|| dir=""` because cw_self_dir ends in a subshell that fails when the
+  # directory has gone; without it `set -e` would abort here and the message
+  # below — the whole reason the check exists — would never be printed.
+  dir=$(cw_self_dir) || dir=""
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    echo "Error: could not work out where claude-work is installed." >&2
+    return 1
+  fi
+
+  # Never write over a checkout somebody is working in. -e rather than -d
+  # because .git is a file in a linked worktree — which is exactly the setup
+  # anyone hacking on this project is using.
+  if [ -e "${dir}/.git" ] || [ -e "${dir}/../.git" ]; then
+    echo "Not upgrading: ${dir} is inside a git checkout. Update it with git." >&2
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required to upgrade. See ${CW_RELEASES_LATEST_URL}" >&2
+    return 1
+  fi
+
+  tmpd=$(mktemp -d 2>/dev/null) || {
+    echo "Error: could not create a temporary directory." >&2
+    return 1
+  }
+  rc=0
+  cw_run_installer "$tmpd" "$dir" || rc=$?
+  rm -rf "$tmpd" 2>/dev/null || :
+  return "$rc"
+}
+
+cw_run_installer() {
+  local tmpd="$1" dir="$2" expected actual
+
+  # install.sh is fetched from a fixed URL and verified before it runs. It is
+  # the piece that executes with the most authority, so it must not also be the
+  # one nobody checks. This is transport integrity, not provenance: SHA256SUMS
+  # ships from the same release, so it proves the file arrived intact, not that
+  # the release itself is trustworthy.
+  if ! cw_download "${CW_LATEST_DOWNLOAD_URL}/install.sh" "${tmpd}/install.sh" ||
+    ! cw_download "${CW_LATEST_DOWNLOAD_URL}/SHA256SUMS" "${tmpd}/SHA256SUMS"; then
+    echo "Error: could not download the installer." >&2
+    return 1
+  fi
+
+  expected=$(sed -n 's/^\([0-9a-f]\{64\}\)  install\.sh$/\1/p' "${tmpd}/SHA256SUMS" | head -n 1)
+  if [ -z "$expected" ]; then
+    echo "Error: the release has no checksum for install.sh — refusing to run it." >&2
+    return 1
+  fi
+
+  actual=$(cw_sha256_of "${tmpd}/install.sh") || {
+    echo "Error: no sha256sum or shasum available to verify the installer." >&2
+    return 1
+  }
+  if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
+    echo "Error: the installer failed checksum verification — refusing to run it." >&2
+    return 1
+  fi
+
+  # --prefix so the copy that is actually running gets replaced. Without it the
+  # installer would pick its own default and could leave a second, older copy
+  # shadowing this one on PATH. If the directory cannot be written, install.sh
+  # says so in its own words rather than this script inventing a second version
+  # of that message.
+  sh "${tmpd}/install.sh" --require-checksum --prefix "$dir"
+}
+
+cw_download() {
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    --connect-timeout 5 --max-time 30 \
+    -o "$2" "$1"
+}
+
+# Start the check, unless we have any reason not to. Every test here is a shell
+# builtin, so a run that opts out does not even pay for the fork.
+cw_update_spawn() {
+  [ -z "${CLAUDE_WORK_NO_UPDATE_CHECK:-}" ] || return 0
+  [ -z "${NO_UPDATE_NOTIFIER:-}" ] || return 0
+  [ -z "${DO_NOT_TRACK:-}" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  # Interactive only: stdin for the prompt later, stderr for the notice.
+  [ -t 0 ] && [ -t 2 ] || return 0
+  [ -n "${HOME:-}" ] || return 0
+  # curl is not a runtime dependency of this tool and must not become one.
+  command -v curl >/dev/null 2>&1 || return 0
+
+  # Detached, and holding no terminal: without </dev/null and the output
+  # redirects the child would keep a tty descriptor and could scribble over
+  # tmux's full-screen rendering or stop on SIGTTOU. cd / so it holds no
+  # reference to a worktree the cleanup step may remove. set +e +u +o pipefail
+  # because all three are inherited, and one unset variable would otherwise
+  # abandon the check halfway through.
+  #
+  # No disown (a non-interactive shell does no job control, so there is nothing
+  # to silence) and no setsid (absent on macOS). --max-time bounds the child's
+  # life.
+  #
+  # The child cannot fire the EXIT trap a second time because this function is
+  # called before that trap is installed, so there is nothing to inherit at the
+  # moment of the fork. That ordering is the invariant — not any general rule
+  # about subshells, which do get a copy of the traps their parent had set.
+  # Moving this call below `trap _cw_on_exit EXIT` would bring the double fire
+  # back, and the cleanup prompt with it.
+  if [ -n "${CLAUDE_WORK_UPDATE_DEBUG:-}" ]; then
+    (
+      set +e +u +o pipefail
+      cd / || exit 0
+      cw_update_fetch
+    ) >/dev/null </dev/null &
+  else
+    (
+      set +e +u +o pipefail
+      cd / || exit 0
+      cw_update_fetch
+    ) >/dev/null 2>&1 </dev/null &
+  fi
+  return 0
+}
+# --- update check end ---
+
 # --- 0. Preflight ---
+
+# Deliberately a short-circuit rather than an option parser: the contract is
+# `claude-work <issue-slug> [base-branch]` and positional arguments are the
+# whole of it. Without this, `claude-work --version` fails the slug pattern
+# below and reports that a slug must start with a letter or digit.
+case "${1:-}" in
+--version | -V)
+  if CW_V=$(cw_own_version); then
+    printf 'claude-work %s\n' "$CW_V"
+    exit 0
+  fi
+  echo "Error: could not read a version from ${CW_SELF}." >&2
+  exit 1
+  ;;
+--upgrade)
+  cw_do_upgrade
+  exit $?
+  ;;
+esac
 
 if [[ -z "$SLUG" ]]; then
   echo "Usage: $(basename "$0") <issue-slug> [base-branch]" >&2
@@ -181,6 +700,12 @@ SESSION_NAME="${SESSION_NAME//[.:]/-}"
 
 cd "$REPO_ROOT"
 
+# Preflight has passed, so this run is going to do real work and will most
+# likely sit in tmux for a while — which is exactly the slack the check needs.
+# Starting it any earlier would mean fetching for runs that are about to fail on
+# a bad slug or a missing dependency.
+cw_update_spawn
+
 # --- 1. Create worktree if it doesn't already exist ---
 
 # Drops registrations whose directory was deleted by hand; without this,
@@ -225,6 +750,10 @@ fi
 # to regain control after attach returns, so we can tell whether Claude Code
 # actually exited (session ended -> offer cleanup) or you just detached
 # (session still alive -> leave everything alone).
+# Installed here so it covers every way out from this point on, including
+# attach_session's early exit, without touching the preflight failures above.
+trap _cw_on_exit EXIT
+
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "tmux session ${SESSION_NAME} already running — attaching."
   attach_session "$SESSION_NAME"
@@ -255,6 +784,10 @@ fi
 
 echo
 echo "Claude Code session for '${SLUG}' has ended."
+
+# The work is finished, as opposed to merely detached from. Only in this state
+# is it reasonable for the exit trap to ask the user anything.
+_CW_SESSION_ENDED=1
 
 # --- 4. Offer cleanup ---
 if ! confirm "Remove worktree and delete branch '${BRANCH}'?"; then

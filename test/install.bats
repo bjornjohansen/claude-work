@@ -235,3 +235,221 @@ check_deps() {
   [ -n "$from_installer" ]
   [ "$from_installer" = "$from_tool" ]
 }
+
+# --- --version / --ref must not be able to move the download ----------------
+#
+# Both are interpolated into the download URL, and curl resolves "../" in a path
+# before sending — so an unvalidated value picks a different *repository*, not
+# just a different file. The artifact and SHA256SUMS come from the same base, so
+# both move together and the checksum would verify an attacker's file against an
+# attacker's checksum. Each case asserts the installer dies before curl runs at
+# all, which is why the stub records every invocation.
+
+# A curl stub that logs its arguments; $CURL_LOG must not exist afterwards.
+stub_logging_curl() {
+  CURL_LOG="${TESTDIR}/curl.log"
+  make_stub curl "printf '%s\n' \"\$*\" >>'${CURL_LOG}'; exit 1"
+}
+
+# Run the real installer with the logging curl on PATH.
+run_installer() {
+  run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" "$@" --prefix "${TESTDIR}/out"
+}
+
+@test "--version rejects path traversal before making any request" {
+  stub_logging_curl
+  run_installer --version 'x/../../../evil-owner/evil-repo/main/install.sh?'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --version"* ]]
+  [ ! -e "$CURL_LOG" ]
+}
+
+@test "--version rejects a value that is not plain digits and dots" {
+  stub_logging_curl
+  run_installer --version '1.2.3;id'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --version"* ]]
+  [ ! -e "$CURL_LOG" ]
+}
+
+@test "--ref rejects path traversal before making any request" {
+  stub_logging_curl
+  run_installer --ref '../../evil-owner/evil-repo/main'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --ref"* ]]
+  [ ! -e "$CURL_LOG" ]
+}
+
+# --modify-path writes the prefix into a shell startup file inside double
+# quotes, and both branches of report_path_situation show it to the user.
+# Anything able to close that quote is arbitrary code in every login shell from
+# then on, which this proves is rejected before it can be written.
+@test "--prefix rejects values that could break out of the shell rc line" {
+  local bad
+  for bad in '/tmp/x";touch /tmp/pwned;echo "' '/tmp/$(id)' '/tmp/`id`' '/tmp/a\b' "/tmp/it's"; do
+    stub_logging_curl
+    run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --modify-path --prefix "$bad"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"invalid --prefix"* ]]
+    [ ! -e "$CURL_LOG" ]
+  done
+}
+
+@test "--prefix still accepts an ordinary path containing spaces" {
+  stub_release_curl
+  real_sums
+  run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --version 0.2.2 --prefix "${TESTDIR}/my bin"
+  [ "$status" -eq 0 ]
+  [ -x "${TESTDIR}/my bin/claude-work" ]
+}
+
+# A flag whose whole purpose is "fail rather than warn when verification is
+# impossible" must never be silently inert. --ref installs are unverified by
+# design, so the combination is refused rather than ignored.
+@test "--require-checksum refuses to be combined with --ref" {
+  stub_logging_curl
+  run env PATH="${STUB}:${PATH}" sh "$INSTALL_SH" --require-checksum --ref main --prefix "${TESTDIR}/out"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot be used with --ref"* ]]
+  [ ! -e "$CURL_LOG" ]
+}
+
+@test "a plain version is accepted and does reach the download" {
+  stub_logging_curl
+  run_installer --version 0.2.2
+  [[ "$output" != *"invalid --version"* ]]
+  [ -e "$CURL_LOG" ]
+  grep -q 'releases/download/v0.2.2/claude-work' "$CURL_LOG"
+}
+
+# --- checksum verification --------------------------------------------------
+#
+# sha*sum -c is not used to decide this: on macOS's /sbin/sha256sum a malformed
+# checksum line exits 0 with only a warning on stderr, and so does an empty
+# checksum file. Both are exactly what a truncated or tampered SHA256SUMS looks
+# like, so the verdict comes from comparing the hashes as strings instead.
+
+# Serve a fake release from $CW_REL_DIR via a curl stub. The stub reads that
+# directory from the environment rather than having it baked in, so the body can
+# be a fully quoted heredoc with no escaping to get wrong.
+stub_release_curl() {
+  export CW_REL_DIR="${TESTDIR}/rel"
+  mkdir -p "$CW_REL_DIR"
+  printf '#!/usr/bin/env bash\n# Version: 0.2.2\necho hi\n' >"${CW_REL_DIR}/claude-work"
+  printf '#!/bin/sh\n: installer\n' >"${CW_REL_DIR}/install.sh"
+
+  cat >"${STUB}/curl" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  case "$a" in http*) url="$a" ;; esac
+  prev="$a"
+done
+f=$(basename "${url%%\?*}")
+[ -f "${CW_REL_DIR}/$f" ] || exit 22
+cat "${CW_REL_DIR}/$f" >"$out"
+EOF
+  chmod +x "${STUB}/curl"
+}
+
+# Regenerate SHA256SUMS covering every published asset, as release.yml does.
+real_sums() {
+  (cd "$CW_REL_DIR" && shasum -a 256 claude-work install.sh >SHA256SUMS)
+}
+
+@test "a valid multi-asset SHA256SUMS verifies and installs" {
+  stub_release_curl
+  real_sums
+  run_installer --version 0.2.2
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Checksum verified."* ]]
+  [ -x "${TESTDIR}/out/claude-work" ]
+}
+
+@test "a malformed (short) checksum line is refused, not treated as verified" {
+  stub_release_curl
+  printf 'deadbeef  claude-work\ndeadbeef  install.sh\n' >"${CW_REL_DIR}/SHA256SUMS"
+  run_installer --version 0.2.2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no usable entry for claude-work"* ]]
+  [ ! -e "${TESTDIR}/out/claude-work" ]
+}
+
+@test "an empty SHA256SUMS is refused, not treated as verified" {
+  stub_release_curl
+  : >"${CW_REL_DIR}/SHA256SUMS"
+  run_installer --version 0.2.2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no usable entry for claude-work"* ]]
+  [ ! -e "${TESTDIR}/out/claude-work" ]
+}
+
+@test "a well-formed but wrong checksum is refused" {
+  stub_release_curl
+  printf '%064d  claude-work\n' 0 >"${CW_REL_DIR}/SHA256SUMS"
+  run_installer --version 0.2.2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"checksum mismatch"* ]]
+  [ ! -e "${TESTDIR}/out/claude-work" ]
+}
+
+@test "SHA256SUMS covering only other assets is refused" {
+  stub_release_curl
+  (cd "$CW_REL_DIR" && shasum -a 256 install.sh >SHA256SUMS)
+  run_installer --version 0.2.2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no usable entry for claude-work"* ]]
+}
+
+@test "--require-checksum turns an unverifiable download into a failure" {
+  run env PATH="${STUB}:${PATH}" "$BASH_BIN" -c '
+    . "$1"
+    TMPDIR_CW=$(mktemp -d); OPT_REF=""; OPT_VERSION="0.2.2"; OPT_REQUIRE_CHECKSUM="yes"
+    have() { case "$1" in sha256sum | shasum) return 1 ;; esac; command -v "$1" >/dev/null 2>&1; }
+    # A well-formed SHA256SUMS entry, so the run reaches the hashing step
+    # instead of stopping at the entry check. The value is irrelevant: with no
+    # hashing tool there is nothing to compare it against.
+    download() { case "$2" in *SHA256SUMS) printf "%064d  claude-work\n" 0 > "$2" ;; *) printf "x\n" > "$2" ;; esac; }
+    fetch_binary "${TMPDIR_CW}/claude-work" 2>&1
+  ' _ "$SOURCEABLE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot verify the download"* ]]
+}
+
+@test "without --require-checksum an unverifiable download only warns" {
+  run env PATH="${STUB}:${PATH}" "$BASH_BIN" -c '
+    . "$1"
+    TMPDIR_CW=$(mktemp -d); OPT_REF=""; OPT_VERSION="0.2.2"; OPT_REQUIRE_CHECKSUM="no"
+    have() { case "$1" in sha256sum | shasum) return 1 ;; esac; command -v "$1" >/dev/null 2>&1; }
+    # A well-formed SHA256SUMS entry, so the run reaches the hashing step
+    # instead of stopping at the entry check. The value is irrelevant: with no
+    # hashing tool there is nothing to compare it against.
+    download() { case "$2" in *SHA256SUMS) printf "%064d  claude-work\n" 0 > "$2" ;; *) printf "x\n" > "$2" ;; esac; }
+    fetch_binary "${TMPDIR_CW}/claude-work" 2>&1
+  ' _ "$SOURCEABLE"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"could not verify the download"* ]]
+}
+
+# --- the binary is replaced by rename, not rewritten in place ---------------
+
+@test "installing over an existing copy replaces the inode" {
+  stub_release_curl
+  real_sums
+  mkdir -p "${TESTDIR}/out"
+  printf '#!/usr/bin/env bash\n# Version: 0.0.1\n' >"${TESTDIR}/out/claude-work"
+  chmod +x "${TESTDIR}/out/claude-work"
+  ln "${TESTDIR}/out/claude-work" "${TESTDIR}/out/hardlink"
+  local before after
+  before=$(ls -i "${TESTDIR}/out/claude-work" | awk '{print $1}')
+
+  run_installer --version 0.2.2
+  [ "$status" -eq 0 ]
+
+  after=$(ls -i "${TESTDIR}/out/claude-work" | awk '{print $1}')
+  [ "$before" != "$after" ]
+  # A copy already open elsewhere keeps reading the bytes it started with.
+  grep -q '0.0.1' "${TESTDIR}/out/hardlink"
+  # And nothing is left staged in the install directory.
+  [ -z "$(find "${TESTDIR}/out" -name '.claude-work.*' -print -quit)" ]
+}

@@ -19,7 +19,10 @@ cw() {
 }
 
 setup_fixture() {
-  TESTDIR="$(mktemp -d)"
+  # Physical path: on macOS mktemp hands back /var/..., which is a symlink to
+  # /private/var. The tool resolves its own location with `pwd -P`, so a test
+  # comparing paths would otherwise be comparing two spellings of one directory.
+  TESTDIR="$(cd "$(mktemp -d)" && pwd -P)"
 
   # Unique per run, so tmux session names can never collide between tests.
   REPO_NAME="cwtest$(printf '%s' "$TESTDIR" | tr -dc 'a-zA-Z0-9' | tail -c 8)"
@@ -31,6 +34,15 @@ setup_fixture() {
   export TMUX_TMPDIR
   # A stale $TMUX would make the script take its switch-client path.
   unset TMUX
+
+  # No test may reach the network or touch the developer's real cache. The
+  # pty-driven cases give the script a real tty on stdin and stderr, which is
+  # all the update check's gate asks for, so without this every local run would
+  # make a request to GitHub per test. Cases that exercise the check turn this
+  # back on against a stubbed curl and this isolated cache directory.
+  export CLAUDE_WORK_NO_UPDATE_CHECK=1
+  export XDG_CACHE_HOME="${TESTDIR}/cache"
+  mkdir -p "$XDG_CACHE_HOME"
 
   # Fake `claude`. The sleep duration is read from a file whose path is baked in
   # at creation time, so tests can change it without depending on tmux
@@ -73,13 +85,157 @@ claude_exits_after() {
   printf '%s\n' "$1" >"${TESTDIR}/claude_sleep"
 }
 
+# --- update check ------------------------------------------------------------
+
+# Turn the update check back on for this test, against a stubbed curl and the
+# fixture's own cache directory. setup_fixture disables it for everything else.
+setup_update_check() {
+  unset CLAUDE_WORK_NO_UPDATE_CHECK
+  # GitHub Actions always sets CI, and the gate skips when it is set — leaving
+  # it would make every case in update-check.bats a no-op that still passes.
+  unset CI
+  unset NO_UPDATE_NOTIFIER
+  unset DO_NOT_TRACK
+
+  CACHE_DIR="${XDG_CACHE_HOME}/claude-work"
+  CACHE_FILE="${CACHE_DIR}/update"
+  mkdir -p "$CACHE_DIR"
+  chmod 0700 "$CACHE_DIR"
+
+  CURL_LOG="${TESTDIR}/curl.log"
+  export CURL_LOG
+
+  # The region of bin/claude-work the unit-level cases source directly.
+  UPDATE_LIB="${TESTDIR}/update-lib.sh"
+  sed -n '/^# --- update check begin ---$/,/^# --- update check end ---$/p' \
+    "$CW_SCRIPT" >"$UPDATE_LIB"
+}
+
+# Write the cache directly: <checked> <latest> <declined>.
+seed_cache() {
+  printf '%s %s %s\n' "$1" "$2" "$3" >"$CACHE_FILE"
+}
+
+# A curl that logs its arguments and answers with a release-tag redirect.
+# $CURL_FAIL makes it fail the way an offline machine would.
+stub_curl() {
+  stub_curl_url "https://github.com/bjornjohansen/claude-work/releases/tag/v9.9.9"
+}
+
+# As stub_curl, but answering with an arbitrary redirect target.
+stub_curl_url() {
+  CURL_REDIRECT="$1"
+  export CURL_REDIRECT
+  cat >"${TESTDIR}/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CURL_LOG"
+[ -z "${CURL_FAIL:-}" ] || exit 7
+printf '%s' "$CURL_REDIRECT"
+EOF
+  chmod +x "${TESTDIR}/bin/curl"
+}
+
+# Run the background check's body in the foreground, so a test can assert on
+# what it did without racing a detached child.
+run_fetch() {
+  # shellcheck disable=SC2016 # $1 is the argument passed to `bash -c`
+  "$CW_BASH" -c '. "$1"; set +e; cw_update_fetch' _ "$UPDATE_LIB"
+}
+
+# Run cw_update_spawn on a real pty, with any VAR=value arguments placed in its
+# environment, waiting for the detached child before returning.
+#
+# The pty is the whole point. cw_update_spawn's tty gate sits immediately after
+# the four opt-out checks, so under bats' `run` — which never supplies a
+# terminal — the function returns at the gate and never reaches them. "No
+# request was made" is then true whether the opt-out checks work or not, and a
+# test asserting it proves nothing. Satisfying the gate leaves the opt-out as
+# the only remaining reason for the check not to run.
+#
+# The interval is pinned to 0 so a fresh cache cannot be the thing that
+# suppresses the request either.
+run_spawn_on_pty() {
+  # shellcheck disable=SC2016 # $1 is the argument passed to `bash -c`
+  python3 "${CW_ROOT}/test/helpers/ptyrun.py" -- \
+    env CLAUDE_WORK_UPDATE_INTERVAL=0 "$@" \
+    "$CW_BASH" -c '. "$1"; set +e; cw_update_spawn; wait' _ "$UPDATE_LIB"
+}
+
+# Run a command with a deadline, exiting 124 if it is exceeded. Not `timeout`:
+# that is GNU coreutils and macOS does not ship it. python3 is already required
+# by the pty harness, so this adds no new dependency.
+with_timeout() {
+  local secs="$1"
+  shift
+  python3 -c '
+import subprocess, sys
+try:
+    sys.exit(subprocess.call(sys.argv[2:], timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+' "$secs" "$@"
+}
+
+# Serve a fake release: an installer that reports how it was called rather than
+# installing anything, plus a SHA256SUMS that really covers it, so the
+# verification the tool does before running it is exercised for real.
+stub_upgrade_curl() {
+  REL_DIR="${TESTDIR}/rel"
+  mkdir -p "$REL_DIR"
+  cat >"${REL_DIR}/install.sh" <<'EOF'
+#!/bin/sh
+printf 'FAKE-INSTALL %s\n' "$*"
+EOF
+  sed 's/^# Version: .*/# Version: 9.9.9/' "$CW_SCRIPT" >"${REL_DIR}/claude-work"
+  regenerate_release_sums
+
+  CURL_REDIRECT="https://github.com/bjornjohansen/claude-work/releases/tag/v9.9.9"
+  export REL_DIR CURL_REDIRECT
+  cat >"${TESTDIR}/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CURL_LOG"
+[ -z "${CURL_FAIL:-}" ] || exit 7
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  case "$a" in http*) url="$a" ;; esac
+  prev="$a"
+done
+case "$url" in
+*releases/latest) printf '%s' "$CURL_REDIRECT"; exit 0 ;;
+esac
+f=$(basename "${url%%\?*}")
+[ -f "${REL_DIR}/$f" ] || exit 22
+cat "${REL_DIR}/$f" >"$out"
+EOF
+  chmod +x "${TESTDIR}/bin/curl"
+}
+
+regenerate_release_sums() {
+  (cd "$REL_DIR" && shasum -a 256 claude-work install.sh >SHA256SUMS)
+}
+
+# An installed copy outside any git checkout, which is what the upgrade path
+# refuses to act on when it is absent.
+install_copy_at() {
+  mkdir -p "$1"
+  cp "$CW_SCRIPT" "$1/claude-work"
+  chmod +x "$1/claude-work"
+}
+
 # Drive the tool through a pty, answering the given prompts in order.
 cw_pty() {
+  cw_pty_script "$CW_SCRIPT" "$@"
+}
+
+# As cw_pty, but running a specific copy of the script.
+cw_pty_script() {
+  local script="$1"
+  shift
   local answers=()
   while [ "$1" != "--" ]; do
     answers+=("$1")
     shift
   done
   shift
-  python3 "${CW_ROOT}/test/helpers/ptyrun.py" "${answers[@]}" -- "$CW_BASH" "$CW_SCRIPT" "$@"
+  python3 "${CW_ROOT}/test/helpers/ptyrun.py" "${answers[@]}" -- "$CW_BASH" "$script" "$@"
 }

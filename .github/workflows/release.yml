@@ -36,7 +36,10 @@ jobs:
         run: |
           set -euo pipefail
           cp bin/claude-work ./claude-work
-          sha256sum claude-work > SHA256SUMS
+          # install.sh is published too, and covered by the same checksum file:
+          # `claude-work --upgrade` fetches and executes it, so the artifact that
+          # runs with the most authority must not be the only unverified one.
+          sha256sum claude-work install.sh > SHA256SUMS
           cat SHA256SUMS
 
       - name: Extract release notes for this version
@@ -61,7 +64,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file notes.md \
-            claude-work SHA256SUMS
+            claude-work install.sh SHA256SUMS
 
   # Proves the real user-facing install path works against the published
   # release, not just the code path CI simulated from a git ref.
