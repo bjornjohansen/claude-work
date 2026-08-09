@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-09
+
+### Fixed
+
+- `install.sh` gave install instructions for tools that were not missing. Any missing dependency
+  triggered `Install git and tmux with: brew install git tmux`, so someone missing only `claude`
+  was told to install two tools they already had. Instructions are now built from the actual set of
+  missing tools, and the wording is singular when only one is missing.
+- `claude-work` exited on the first missing command, so a run missing both `tmux` and `claude`
+  reported only `tmux`. It now names every missing command in one go and, like the installer,
+  offers install instructions for exactly those.
+
+### Added
+
+- `install.sh` detects the Linux package manager (apt, dnf, pacman, zypper) instead of always
+  suggesting apt.
+- When the installer runs as root under `sudo`, a missing-dependency warning now notes that the
+  check saw root's `PATH`, so a per-user install of `claude` can look missing when it is not.
+- Tests for the installer's dependency check (`test/install.bats`), which previously had none, and
+  a CI assertion that an install on a runner with git present never suggests installing git.
+
+### Security
+
+- The suggested `sudo <package manager> install ...` command is now chosen by probing `/usr/bin`,
+  `/bin`, `/usr/sbin` and `/sbin` directly instead of searching `PATH`. An executable planted in a
+  user-writable `PATH` directory could otherwise decide the text of a command the user is being
+  asked to paste into a root shell. `/usr/local/bin` is excluded because it is frequently
+  user-writable.
+- `SUDO_USER` is checked against the character set a username can contain before it is printed. It
+  is an ordinary environment variable, so echoing it verbatim would let it carry terminal escape
+  sequences into output that elsewhere reports things like a checksum mismatch.
+
 ## [0.2.1] - 2026-08-09
 
 ### Fixed
@@ -54,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GIT_REMOTE` and `BRANCH_PREFIX` environment variables.
 - Offline fallback to the local base branch, with a warning, when the remote cannot be fetched.
 
-[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bjornjohansen/claude-work/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/bjornjohansen/claude-work/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bjornjohansen/claude-work/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bjornjohansen/claude-work/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bjornjohansen/claude-work/releases/tag/v0.1.0
