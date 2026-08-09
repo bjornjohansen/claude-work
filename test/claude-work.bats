@@ -39,11 +39,24 @@ teardown() {
   [ -d "${TESTDIR}/${REPO_NAME}-issue_1.2-b" ]
 }
 
-@test "reports which required command is missing" {
-  # A PATH with git but no tmux/claude.
-  run env PATH="/usr/bin:/bin" "$CW_BASH" "$CW_SCRIPT" some-slug
+@test "names every missing command, and only instructs on those" {
+  # A PATH with git but neither tmux nor claude, built from stubs so the result
+  # does not depend on what the machine running the tests has installed. `uname`
+  # is needed because the message picks a package manager.
+  local stub="${TESTDIR}/depstub"
+  mkdir -p "$stub"
+  printf '#!/bin/sh\n:\n' >"${stub}/git"
+  printf '#!/bin/sh\necho Darwin\n' >"${stub}/uname"
+  chmod +x "${stub}/git" "${stub}/uname"
+
+  run env PATH="$stub" "$(command -v "$CW_BASH")" "$CW_SCRIPT" some-slug
   [ "$status" -eq 1 ]
-  [[ "$output" == *"required command"* ]]
+  # Both missing commands named in one run, not just the first one found.
+  [[ "$output" == *"not on your PATH: tmux claude"* ]]
+  [[ "$output" == *"brew install tmux"* ]]
+  [[ "$output" == *"https://claude.com/claude-code"* ]]
+  # git is present, so it must not turn up in the instructions.
+  [[ "$output" != *"install git"* ]]
 }
 
 # --- worktree creation ------------------------------------------------------
