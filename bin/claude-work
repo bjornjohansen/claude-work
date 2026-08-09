@@ -140,6 +140,208 @@ attach_session() {
   tmux attach-session -t "$1"
 }
 
+# --- update check begin ---
+#
+# Look up the latest release in the background and say so when the session ends.
+#
+# Two facts drive the shape of this. The check costs ~340ms of network, and
+# startup must stay free — so nothing here blocks: one detached fork (~0.4ms)
+# and the foreground moves on. And a notice printed at startup is invisible,
+# because tmux takes the alternate screen a few milliseconds later; the moments
+# the user can actually read are the ones where the tool hands control back.
+# Firing at startup and reading at exit also means the answer is current for
+# *this* run, since the tmux session gives the fetch minutes to hours of slack.
+#
+# The cache is untrusted input, on the same footing as the network response.
+# Writing one small file under ~/.cache is a primitive nothing flags, and it
+# feeds a URL, an arithmetic expression and the terminal — so every field is
+# re-validated on read, in cw_cache_read, and nothing here ever uses `source`
+# or `eval`.
+
+# Hardcoded on purpose. No environment variable may point the check at another
+# host: that would be a tidy foothold for anyone who can set one.
+CW_RELEASES_LATEST_URL="https://github.com/bjornjohansen/claude-work/releases/latest"
+CW_RELEASE_TAG_PREFIX="https://github.com/bjornjohansen/claude-work/releases/tag/v"
+
+# The one authority on what a version may look like. Anchored and length-bound.
+# Rejecting "1.2.3-rc1" is deliberate: prereleases must never nag.
+cw_is_semver() {
+  case "${1:-}" in '' | -) return 1 ;; esac
+  [[ "$1" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]
+}
+
+# Echo the cache file path, or fail when there is nowhere usable to keep it.
+# Both the writer and the reader go through here, so they cannot disagree about
+# where the file lives — a disagreement would be silent and harmless-looking.
+cw_cache_file() {
+  local d="${XDG_CACHE_HOME:-}"
+  case "$d" in
+  /*) ;;
+  *)
+    # A relative XDG_CACHE_HOME would resolve against the caller's cwd, which by
+    # this point is the user's repository. Ignore it rather than litter there.
+    [ -n "${HOME:-}" ] || return 1
+    d="${HOME}/.cache"
+    ;;
+  esac
+  d="${d}/claude-work"
+  if [ ! -d "$d" ]; then
+    mkdir -p "$d" 2>/dev/null || return 1
+    # Only our own directory, not the parent: with -p, -m would apply to the
+    # deepest one anyway, and chmodding someone's ~/.cache is not our business.
+    chmod 0700 "$d" 2>/dev/null || :
+  fi
+  # Someone else's directory is someone else's content.
+  [ ! -L "$d" ] && [ -O "$d" ] || return 1
+  printf '%s\n' "${d}/update"
+}
+
+# Load the cache into CW_CHECKED / CW_LATEST / CW_DECLINED, which are always
+# left with safe values whether or not there was anything to read.
+#
+# Three fields, no schema version: if the format ever changes, change the
+# filename instead and old files are ignored by construction.
+cw_cache_read() {
+  local f c l d
+  CW_CHECKED=0
+  CW_LATEST=-
+  CW_DECLINED=-
+
+  f=$(cw_cache_file) || return 1
+
+  # -f is what stops `read` from blocking forever on a fifo, and it stays false
+  # through a symlink to one. It is *not* enough on its own: -f follows a
+  # symlink to a regular file, so an attacker-planted link would be read
+  # happily. Hence -L and -O as well.
+  [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ] && [ -r "$f" ] || return 0
+
+  # `read` reports failure on a last line with no newline but still assigns.
+  read -r c l d <"$f" || :
+
+  # Default first, then validate the value we are actually keeping — testing
+  # "${c:-0}" while assigning to $c would leave an empty field empty.
+  #
+  # A non-numeric value reaching $(( )) is command execution: arithmetic
+  # evaluates array subscripts, so "x[0$(...)]" runs what is inside. This case
+  # is the only thing between a writable cache file and a shell.
+  c="${c:-0}"
+  case "$c" in '' | *[!0-9]*) c=0 ;; esac
+  cw_is_semver "${l:-}" || l=-
+  cw_is_semver "${d:-}" || d=-
+
+  CW_CHECKED="$c"
+  CW_LATEST="$l"
+  CW_DECLINED="$d"
+}
+
+# Replace the cache atomically: same directory, so mv is rename(2) and a
+# concurrent reader sees either the old file or the new one, never a partial.
+# Never fails the caller — a cache we cannot write is not worth an error.
+cw_cache_write() {
+  local f t
+  f=$(cw_cache_file) || return 0
+  t=$(mktemp "${f%/*}/.update.XXXXXX" 2>/dev/null) || return 0
+  if printf '%s %s %s\n' "$1" "$2" "$3" >"$t" 2>/dev/null &&
+    mv -f "$t" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$t" 2>/dev/null || :
+  return 0
+}
+
+# The body of the background check. Runs detached; its only output is the cache.
+cw_update_fetch() {
+  local now interval url tag
+
+  now=$(date +%s) || return 0
+  case "$now" in '' | *[!0-9]*) return 0 ;; esac
+
+  interval="${CLAUDE_WORK_UPDATE_INTERVAL:-86400}"
+  case "$interval" in '' | *[!0-9]*) interval=86400 ;; esac
+
+  cw_cache_read || return 0
+
+  # A stamp in the future means the clock moved, not that we just checked —
+  # treating it as fresh would disable the check until the date caught up.
+  if [ "$CW_CHECKED" -le "$now" ] && [ $((now - CW_CHECKED)) -lt "$interval" ]; then
+    return 0
+  fi
+
+  # Stamp before fetching, not after. Without this, a machine that is offline
+  # retries on every single run; with it, one failed attempt costs one attempt
+  # per interval. Keeping the known version means a failure never erases it.
+  cw_cache_write "$now" "$CW_LATEST" "$CW_DECLINED"
+
+  # No -L: one request, one 302, an empty body. github.com's redirect is used
+  # rather than api.github.com because the API allows 60 requests an hour per
+  # source IP, shared with every other unauthenticated caller behind the same
+  # NAT — which would break the check for exactly the users most likely to be
+  # running something old. No --retry: a failure waits for the next interval,
+  # rather than turning a GitHub outage into a stampede. No custom User-Agent
+  # and no cookie jar, deliberately: either would turn an ambient request into
+  # something that identifies the caller across runs.
+  url=$(curl -fs \
+    --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 8 \
+    -o /dev/null -w '%{redirect_url}' \
+    "$CW_RELEASES_LATEST_URL") || return 0
+
+  [ -z "${CLAUDE_WORK_UPDATE_DEBUG:-}" ] || echo "claude-work: redirect_url=${url}" >&2
+
+  # Match the whole expected prefix, not just the shape of the tail: captive
+  # portals answer with a 302 of their own, and a semver check alone would
+  # happily accept the version out of one. If the repository is ever renamed
+  # this stops matching and the check goes quiet, which is the right direction
+  # to fail.
+  case "$url" in
+  "$CW_RELEASE_TAG_PREFIX"*) tag=${url#"$CW_RELEASE_TAG_PREFIX"} ;;
+  *) return 0 ;;
+  esac
+  cw_is_semver "$tag" || return 0
+
+  cw_cache_write "$now" "$tag" "$CW_DECLINED"
+}
+
+# Start the check, unless we have any reason not to. Every test here is a shell
+# builtin, so a run that opts out does not even pay for the fork.
+cw_update_spawn() {
+  [ -z "${CLAUDE_WORK_NO_UPDATE_CHECK:-}" ] || return 0
+  [ -z "${NO_UPDATE_NOTIFIER:-}" ] || return 0
+  [ -z "${DO_NOT_TRACK:-}" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  # Interactive only: stdin for the prompt later, stderr for the notice.
+  [ -t 0 ] && [ -t 2 ] || return 0
+  [ -n "${HOME:-}" ] || return 0
+  # curl is not a runtime dependency of this tool and must not become one.
+  command -v curl >/dev/null 2>&1 || return 0
+
+  # Detached, and holding no terminal: without </dev/null and the output
+  # redirects the child would keep a tty descriptor and could scribble over
+  # tmux's full-screen rendering or stop on SIGTTOU. cd / so it holds no
+  # reference to a worktree the cleanup step may remove. set +e +u +o pipefail
+  # because all three are inherited, and one unset variable would otherwise
+  # abandon the check halfway through.
+  #
+  # No disown (a non-interactive shell does no job control, so there is nothing
+  # to silence) and no setsid (absent on macOS). --max-time bounds the child's
+  # life; the EXIT trap is not inherited by a subshell, so it cannot fire twice.
+  if [ -n "${CLAUDE_WORK_UPDATE_DEBUG:-}" ]; then
+    (
+      set +e +u +o pipefail
+      cd / || exit 0
+      cw_update_fetch
+    ) >/dev/null </dev/null &
+  else
+    (
+      set +e +u +o pipefail
+      cd / || exit 0
+      cw_update_fetch
+    ) >/dev/null 2>&1 </dev/null &
+  fi
+  return 0
+}
+# --- update check end ---
+
 # --- 0. Preflight ---
 
 # Deliberately a short-circuit rather than an option parser: the contract is
@@ -218,6 +420,12 @@ SESSION_NAME="cc-${REPO_NAME}-${SLUG}"
 SESSION_NAME="${SESSION_NAME//[.:]/-}"
 
 cd "$REPO_ROOT"
+
+# Preflight has passed, so this run is going to do real work and will most
+# likely sit in tmux for a while — which is exactly the slack the check needs.
+# Starting it any earlier would mean fetching for runs that are about to fail on
+# a bad slug or a missing dependency.
+cw_update_spawn
 
 # --- 1. Create worktree if it doesn't already exist ---
 

@@ -32,6 +32,15 @@ setup_fixture() {
   # A stale $TMUX would make the script take its switch-client path.
   unset TMUX
 
+  # No test may reach the network or touch the developer's real cache. The
+  # pty-driven cases give the script a real tty on stdin and stderr, which is
+  # all the update check's gate asks for, so without this every local run would
+  # make a request to GitHub per test. Cases that exercise the check turn this
+  # back on against a stubbed curl and this isolated cache directory.
+  export CLAUDE_WORK_NO_UPDATE_CHECK=1
+  export XDG_CACHE_HOME="${TESTDIR}/cache"
+  mkdir -p "$XDG_CACHE_HOME"
+
   # Fake `claude`. The sleep duration is read from a file whose path is baked in
   # at creation time, so tests can change it without depending on tmux
   # propagating environment variables into new sessions.
