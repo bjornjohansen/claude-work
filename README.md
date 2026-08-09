@@ -91,6 +91,9 @@ When stdin is not a terminal, cleanup is always skipped. Nothing is deleted non-
 | --- | --- | --- |
 | `GIT_REMOTE` | `origin` | Remote to fetch the base branch from |
 | `BRANCH_PREFIX` | `fix` | Prefix for the created branch |
+| `CLAUDE_WORK_NO_UPDATE_CHECK` | unset | Set to anything to disable the update check |
+| `CLAUDE_WORK_UPDATE_INTERVAL` | `86400` | Seconds between update checks |
+| `CLAUDE_WORK_UPDATE_DEBUG` | unset | Report why a check found nothing |
 
 ```bash
 BRANCH_PREFIX=feat claude-work new-onboarding
@@ -98,6 +101,51 @@ BRANCH_PREFIX=feat claude-work new-onboarding
 
 If the base branch cannot be fetched, the script warns and falls back to the local branch rather
 than failing outright — useful offline.
+
+## Update checks
+
+`claude-work` is installed by a script, not a package manager, so nothing else would tell you a new
+version exists. It looks, and says so when your session ends.
+
+**What it does.** Once a day at most, in a background process that startup never waits for, it makes
+a single HTTPS request to `github.com` and reads the version out of the redirect. The response body
+is discarded. Measured cost at startup: under 1 ms, against the ~15 ms `git worktree prune` already
+spends a moment later.
+
+**What it sends.** Nothing about you. No custom `User-Agent`, no cookies, no identifier of any kind
+— an ordinary request, indistinguishable from opening the releases page in a browser. GitHub sees
+your IP, as it would for any request you make to it.
+
+**When it stays quiet.** When stdin or stderr is not a terminal, when `$CI` is set, and when any of
+`CLAUDE_WORK_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` or `DO_NOT_TRACK` is set. Turn it off for good
+with:
+
+```bash
+echo 'export CLAUDE_WORK_NO_UPDATE_CHECK=1' >> ~/.zshrc
+```
+
+The notice appears on stderr when the session ends, naming both versions. If you decline the
+upgrade, you are not asked about that version again. Detaching from a session never prompts — you
+get the notice and your shell straight back.
+
+## Upgrading
+
+```bash
+claude-work --upgrade
+```
+
+Be aware of what this does: **it downloads `install.sh` from the latest GitHub release and runs
+it.** The installer is checked against the release's `SHA256SUMS` first and is not run if that
+fails, and it installs into the directory the running copy already occupies rather than picking a
+new one. It refuses outright to touch a copy inside a git checkout.
+
+That checksum proves the file arrived intact. It does not prove the release is trustworthy —
+`SHA256SUMS` is published by the same release, so anything able to publish a release could publish a
+matching checksum. This is the same trust you extended by installing with `curl | bash` in the first
+place, with the difference that the tool now re-extends it whenever you say yes. If you would rather
+that were always a deliberate act, disable the check and upgrade by re-running the installer
+yourself. Signing the releases, which is what would actually close that gap, is tracked in
+[`TASKS.md`](TASKS.md).
 
 ## Notes
 

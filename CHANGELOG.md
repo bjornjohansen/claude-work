@@ -24,10 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `claude-work` now notices when a newer release exists and says so as your session ends. The
+  lookup runs in a detached background process started after preflight, so startup is not delayed —
+  under 1 ms, against the ~15 ms `git worktree prune` spends moments later. It happens at most once
+  a day, never when stdin/stderr is not a terminal or `$CI` is set, and is disabled by any of
+  `CLAUDE_WORK_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` or `DO_NOT_TRACK`. One HTTPS request to
+  github.com with no custom `User-Agent`, no cookies and the response body discarded. Declining an
+  upgrade is remembered, so the same version is not offered again.
+  The notice appears when the work is finished; detaching from a session never prompts.
+- `claude-work --upgrade` replaces the running copy in place. It downloads `install.sh` from the
+  latest release, verifies it against that release's `SHA256SUMS` before running it, and installs
+  into the directory the running copy already occupies. It refuses to touch a copy inside a git
+  checkout. See the README for what that trust does and does not cover.
+- `claude-work --version` (also `-V`). Previously this failed with a message about slugs.
 - `install.sh --require-checksum` fails instead of warning when no `sha256sum` or `shasum` is
   available to verify the download.
 - `install.sh` is now published as a release asset and covered by `SHA256SUMS`, so it can be
   verified before it is run.
+- A weekly workflow checks that the `releases/latest` redirect still has the shape the update check
+  depends on. Every failure mode in the check is deliberately silent, so without this a rename or a
+  changed redirect would disable it for everyone with nothing to show for it.
 
 ### Fixed
 
