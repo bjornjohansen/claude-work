@@ -2,7 +2,7 @@
 #
 # claude-work — spin up a git worktree + tmux session + Claude Code for one issue
 #
-# Version: 0.2.2
+# Version: 0.3.0
 #
 # Usage:
 #   claude-work <issue-slug> [base-branch]
