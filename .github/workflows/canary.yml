@@ -1,0 +1,91 @@
+name: Release redirect canary
+
+# The update check reads the latest version out of the Location header that
+# github.com/<repo>/releases/latest returns, and matches it against a prefix
+# hardcoded in bin/claude-work. That is web-UI behaviour rather than a promised
+# API, and every failure mode in the check is deliberately silent — so if the
+# shape ever changes, or the repository is renamed, the feature would simply
+# stop working for everyone with nothing to show for it.
+#
+# This is the only observability the check needs: one request a week that fails
+# loudly when the contract it depends on no longer holds.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  redirect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The releases/latest redirect still matches what the tool expects
+        run: |
+          set -euo pipefail
+
+          # Read the two constants from the script, so this test tracks the
+          # code rather than a copy of it that could drift.
+          latest_url=$(sed -n 's/^CW_RELEASES_LATEST_URL="\(.*\)"$/\1/p' bin/claude-work)
+          tag_prefix=$(sed -n 's/^CW_RELEASE_TAG_PREFIX="\(.*\)"$/\1/p' bin/claude-work)
+          [ -n "$latest_url" ] && [ -n "$tag_prefix" ] || {
+            echo "::error::could not read the update-check URLs from bin/claude-work"
+            exit 1
+          }
+          echo "latest_url=${latest_url}"
+          echo "tag_prefix=${tag_prefix}"
+
+          # Exactly the request the tool makes: no -L, no body, just the
+          # redirect target.
+          redirect=$(curl -fs --proto '=https' --tlsv1.2 \
+            --connect-timeout 5 --max-time 15 \
+            -o /dev/null -w '%{redirect_url}' "$latest_url")
+          echo "redirect=${redirect}"
+
+          case "$redirect" in
+            "${tag_prefix}"*) tag="${redirect#"${tag_prefix}"}" ;;
+            *)
+              echo "::error::redirect no longer starts with ${tag_prefix} — the update check has gone silent"
+              exit 1
+              ;;
+          esac
+
+          # The tool only accepts a plain X.Y.Z, so a release published as a
+          # prerelease or with an unusual tag would also silence the check.
+          case "$tag" in
+            *[!0-9.]* | *..* | '')
+              echo "::error::latest release tag '${tag}' is not a plain X.Y.Z — the update check would ignore it"
+              exit 1
+              ;;
+          esac
+          echo "Latest release advertises ${tag}; the update check would see it."
+
+      - name: The published release still carries a verifiable install.sh
+        run: |
+          set -euo pipefail
+
+          # claude-work --upgrade downloads these two and refuses to run the
+          # installer unless the checksum matches, so a release missing either
+          # would break upgrades rather than merely the notice.
+          base=$(sed -n 's/^CW_LATEST_DOWNLOAD_URL="\(.*\)"$/\1/p' bin/claude-work)
+          [ -n "$base" ] || { echo "::error::could not read the download URL"; exit 1; }
+
+          tmp=$(mktemp -d)
+          curl -fsSL --proto '=https' --tlsv1.2 -o "${tmp}/install.sh" "${base}/install.sh"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
+
+          expected=$(sed -n 's/^\([0-9a-f]\{64\}\)  install\.sh$/\1/p' "${tmp}/SHA256SUMS" | head -n 1)
+          [ -n "$expected" ] || {
+            echo "::error::the latest release publishes no checksum for install.sh — --upgrade would refuse to run"
+            exit 1
+          }
+          actual=$(sha256sum "${tmp}/install.sh" | cut -d' ' -f1)
+          [ "$expected" = "$actual" ] || {
+            echo "::error::published install.sh does not match its checksum"
+            exit 1
+          }
+          echo "install.sh is published and verifies."
