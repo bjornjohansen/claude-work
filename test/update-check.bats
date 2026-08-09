@@ -288,6 +288,142 @@ in_lib() {
   [[ "$output" != *"is available"* ]]
 }
 
+# --- the upgrade ------------------------------------------------------------
+
+# Detaching means the user has stepped away mid-task and wants their shell
+# back. A blocking question there would be worse than no feature at all.
+@test "detaching shows the notice but never asks a question" {
+  claude_exits_after 300
+  seed_cache "$(date +%s)" 9.9.9 -
+
+  # Detach by killing the session's client; the session itself stays alive.
+  (
+    sleep 3
+    tmux detach-client -s "cc-${REPO_NAME}-issue-detach" 2>/dev/null
+  ) &
+  run with_timeout 45 python3 "${CW_ROOT}/test/helpers/ptyrun.py" -- \
+    "$CW_BASH" "$CW_SCRIPT" issue-detach
+  wait
+
+  [ "$status" -ne 124 ]
+  [[ "$output" == *"Detached from"* ]]
+  [[ "$output" == *"is available"* ]]
+  [[ "$output" == *"claude-work --upgrade"* ]]
+  [[ "$output" != *"Upgrade claude-work to"* ]]
+}
+
+@test "running from a git checkout is never overwritten" {
+  stub_upgrade_curl
+  run "$CW_BASH" "$CW_SCRIPT" --upgrade
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"inside a git checkout"* ]]
+  # Nothing was even fetched.
+  [ ! -e "$CURL_LOG" ]
+}
+
+@test "--upgrade verifies the installer and hands it the running prefix" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+
+  run "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FAKE-INSTALL --require-checksum --prefix ${TESTDIR}/prefix"* ]]
+
+  # Only fixed URLs: no version is ever interpolated into a request.
+  grep -q 'releases/latest/download/install.sh' "$CURL_LOG"
+  grep -q 'releases/latest/download/SHA256SUMS' "$CURL_LOG"
+  ! grep -qE 'releases/download/v' "$CURL_LOG"
+}
+
+@test "--upgrade through a symlink upgrades the real directory" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+  mkdir -p "${TESTDIR}/linkdir"
+  ln -s "${TESTDIR}/prefix/claude-work" "${TESTDIR}/linkdir/claude-work"
+
+  run "$CW_BASH" "${TESTDIR}/linkdir/claude-work" --upgrade
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--prefix ${TESTDIR}/prefix"* ]]
+  [[ "$output" != *"--prefix ${TESTDIR}/linkdir"* ]]
+}
+
+@test "an installer that fails its checksum is not run" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+  # Change the installer without regenerating the sums.
+  printf '#!/bin/sh\ntouch "%s/OWNED"\n' "$TESTDIR" >"${REL_DIR}/install.sh"
+
+  run "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"failed checksum verification"* ]]
+  [ ! -e "${TESTDIR}/OWNED" ]
+}
+
+@test "a release with no checksum for the installer is refused" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+  (cd "$REL_DIR" && shasum -a 256 claude-work >SHA256SUMS)
+
+  run "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no checksum for install.sh"* ]]
+}
+
+@test "a download failure is reported, not ignored" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+
+  run env CURL_FAIL=1 "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not download the installer"* ]]
+}
+
+# cw_do_upgrade is shared by --upgrade and the exit prompt, so it must not
+# depend on either caller's state. Reading the trap's exit-status variable here
+# would abort under `set -u` — after the new binary had already been written.
+@test "--upgrade exits cleanly with the installer's status" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+
+  run "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [[ "$output" != *"unbound variable"* ]]
+  [ "$status" -eq 0 ]
+
+  printf '#!/bin/sh\nexit 3\n' >"${REL_DIR}/install.sh"
+  regenerate_release_sums
+  run "$CW_BASH" "${TESTDIR}/prefix/claude-work" --upgrade
+  [ "$status" -eq 3 ]
+  [[ "$output" != *"unbound variable"* ]]
+}
+
+@test "accepting the prompt runs the upgrade once the session has ended" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+  claude_exits_after 1
+  seed_cache "$(date +%s)" 9.9.9 -
+
+  run cw_pty_script "${TESTDIR}/prefix/claude-work" n y -- issue-accept
+  [[ "$output" == *"Upgrade claude-work to 9.9.9 now?"* ]]
+  [[ "$output" == *"FAKE-INSTALL --require-checksum --prefix ${TESTDIR}/prefix"* ]]
+}
+
+@test "declining records the version and keeps the check interval" {
+  stub_upgrade_curl
+  install_copy_at "${TESTDIR}/prefix"
+  claude_exits_after 1
+  seed_cache 4242 9.9.9 -
+  # An ancient timestamp is stale, so without a long interval the background
+  # check would refetch mid-test and overwrite the very field being asserted.
+  export CLAUDE_WORK_UPDATE_INTERVAL=9999999999
+
+  run cw_pty_script "${TESTDIR}/prefix/claude-work" n n -- issue-decline
+  [[ "$output" == *"Upgrade claude-work to 9.9.9 now?"* ]]
+  [[ "$output" != *"FAKE-INSTALL"* ]]
+  # Declined is remembered; the timestamp is untouched so declining does not
+  # also postpone the next check.
+  [ "$(cat "$CACHE_FILE")" = "4242 9.9.9 9.9.9" ]
+}
+
 @test "the notice goes to stderr" {
   claude_exits_after 1
   seed_cache "$(date +%s)" 9.9.9 -

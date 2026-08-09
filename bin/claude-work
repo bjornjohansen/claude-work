@@ -7,6 +7,7 @@
 # Usage:
 #   claude-work <issue-slug> [base-branch]
 #   claude-work --version
+#   claude-work --upgrade
 #
 # Example:
 #   claude-work issue-123
@@ -15,6 +16,16 @@
 # Environment:
 #   GIT_REMOTE     Remote to fetch the base branch from (default: origin)
 #   BRANCH_PREFIX  Prefix for the created branch     (default: fix)
+#
+#   CLAUDE_WORK_NO_UPDATE_CHECK   Set to anything to disable the update check.
+#                                 NO_UPDATE_NOTIFIER and DO_NOT_TRACK also work.
+#   CLAUDE_WORK_UPDATE_INTERVAL   Seconds between checks (default: 86400)
+#   CLAUDE_WORK_UPDATE_DEBUG      Set to report why a check found nothing
+#
+# The update check makes one HTTPS request to github.com at most once a day,
+# in the background, and never when stdin/stderr is not a terminal or $CI is
+# set. Nothing about you is sent: no custom User-Agent, no cookies, and the
+# response body is discarded.
 #
 # What it does:
 #   1. Creates a new worktree at ../<repo>-<issue-slug>
@@ -151,6 +162,11 @@ attach_session() {
 # host: that would be a tidy foothold for anyone who can set one.
 CW_RELEASES_LATEST_URL="https://github.com/bjornjohansen/claude-work/releases/latest"
 CW_RELEASE_TAG_PREFIX="https://github.com/bjornjohansen/claude-work/releases/tag/v"
+# Note there is no version in this one either. The cached version is never
+# interpolated into a URL: curl resolves "../" in a path before sending, so a
+# cache someone else can write would otherwise choose the repository we
+# download from.
+CW_LATEST_DOWNLOAD_URL="https://github.com/bjornjohansen/claude-work/releases/latest/download"
 
 # Echo this script's own version, or fail if it cannot be established.
 #
@@ -381,7 +397,150 @@ _cw_on_exit() {
   echo >&2
   echo "claude-work ${CW_LATEST} is available (you have ${mine})" >&2
   echo "  ${CW_RELEASE_TAG_PREFIX}${CW_LATEST}" >&2
+
+  # Only offer to do it when the session has actually finished. On the detach
+  # path the user has stepped away mid-task and expects their shell back
+  # immediately; a blocking question there is the one regression that would
+  # make this feature worse than nothing.
+  if [ -n "${_CW_SESSION_ENDED:-}" ] && [ -t 0 ]; then
+    cw_offer_upgrade
+  else
+    echo "  Upgrade with: claude-work --upgrade" >&2
+  fi
   return 0
+}
+
+# Discard anything typed before the prompt was printed, so a "y" aimed at the
+# cleanup confirmation a moment earlier is not read as consent to fetch and run
+# code. bash 3.2's `read -t 0` cannot report pending input — it returns failure
+# even when there is some — so this is best effort there and costs nothing.
+# The prompt defaults to no either way.
+# shellcheck disable=SC2034 # `junk` is read into deliberately and never used
+cw_drain_input() {
+  local junk i=0
+  while [ "$i" -lt 100 ] && read -r -t 0 junk 2>/dev/null; do
+    read -r -t 1 junk 2>/dev/null || break
+    i=$((i + 1))
+  done
+  return 0
+}
+
+cw_offer_upgrade() {
+  cw_drain_input
+  if confirm "Upgrade claude-work to ${CW_LATEST} now?"; then
+    cw_do_upgrade
+    return 0
+  fi
+  # Remember the refusal, but keep the existing timestamp so declining does not
+  # also reset the check interval.
+  cw_cache_write "$CW_CHECKED" "$CW_LATEST" "$CW_LATEST"
+  echo "Left alone. Run 'claude-work --upgrade' whenever you like." >&2
+  return 0
+}
+
+# Echo the SHA-256 of $1 as bare hex, or return 2 when nothing can compute it.
+cw_sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    return 2
+  fi
+}
+
+# Echo the directory holding the real script, following symlinks. Bounded, so a
+# symlink loop cannot spin. Only the upgrade path needs this, which is why the
+# forks it costs are acceptable — startup resolves nothing.
+cw_self_dir() {
+  local p="$CW_SELF" t i=0
+  while [ -L "$p" ] && [ "$i" -lt 20 ]; do
+    t=$(readlink "$p") || break
+    case "$t" in
+    /*) p="$t" ;;
+    *) p="$(dirname "$p")/$t" ;;
+    esac
+    i=$((i + 1))
+  done
+  (cd "$(dirname "$p")" 2>/dev/null && pwd -P)
+}
+
+# Fetch the published installer, check it, and let it do the work. Returns
+# rather than exits: it has two callers, and depending on either one's state
+# would make it wrong for the other.
+cw_do_upgrade() {
+  local dir tmpd rc
+
+  dir=$(cw_self_dir)
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    echo "Error: could not work out where claude-work is installed." >&2
+    return 1
+  fi
+
+  # Never write over a checkout somebody is working in. -e rather than -d
+  # because .git is a file in a linked worktree — which is exactly the setup
+  # anyone hacking on this project is using.
+  if [ -e "${dir}/.git" ] || [ -e "${dir}/../.git" ]; then
+    echo "Not upgrading: ${dir} is inside a git checkout. Update it with git." >&2
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required to upgrade. See ${CW_RELEASES_LATEST_URL}" >&2
+    return 1
+  fi
+
+  tmpd=$(mktemp -d 2>/dev/null) || {
+    echo "Error: could not create a temporary directory." >&2
+    return 1
+  }
+  rc=0
+  cw_run_installer "$tmpd" "$dir" || rc=$?
+  rm -rf "$tmpd" 2>/dev/null || :
+  return "$rc"
+}
+
+cw_run_installer() {
+  local tmpd="$1" dir="$2" expected actual
+
+  # install.sh is fetched from a fixed URL and verified before it runs. It is
+  # the piece that executes with the most authority, so it must not also be the
+  # one nobody checks. This is transport integrity, not provenance: SHA256SUMS
+  # ships from the same release, so it proves the file arrived intact, not that
+  # the release itself is trustworthy.
+  if ! cw_download "${CW_LATEST_DOWNLOAD_URL}/install.sh" "${tmpd}/install.sh" ||
+    ! cw_download "${CW_LATEST_DOWNLOAD_URL}/SHA256SUMS" "${tmpd}/SHA256SUMS"; then
+    echo "Error: could not download the installer." >&2
+    return 1
+  fi
+
+  expected=$(sed -n 's/^\([0-9a-f]\{64\}\)  install\.sh$/\1/p' "${tmpd}/SHA256SUMS" | head -n 1)
+  if [ -z "$expected" ]; then
+    echo "Error: the release has no checksum for install.sh — refusing to run it." >&2
+    return 1
+  fi
+
+  actual=$(cw_sha256_of "${tmpd}/install.sh") || {
+    echo "Error: no sha256sum or shasum available to verify the installer." >&2
+    return 1
+  }
+  if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
+    echo "Error: the installer failed checksum verification — refusing to run it." >&2
+    return 1
+  fi
+
+  # --prefix so the copy that is actually running gets replaced. Without it the
+  # installer would pick its own default and could leave a second, older copy
+  # shadowing this one on PATH. If the directory cannot be written, install.sh
+  # says so in its own words rather than this script inventing a second version
+  # of that message.
+  sh "${tmpd}/install.sh" --require-checksum --prefix "$dir"
+}
+
+cw_download() {
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    --connect-timeout 5 --max-time 30 \
+    -o "$2" "$1"
 }
 
 # Start the check, unless we have any reason not to. Every test here is a shell
@@ -438,6 +597,10 @@ case "${1:-}" in
   fi
   echo "Error: could not read a version from ${CW_SELF}." >&2
   exit 1
+  ;;
+--upgrade)
+  cw_do_upgrade
+  exit $?
   ;;
 esac
 
@@ -587,6 +750,10 @@ fi
 
 echo
 echo "Claude Code session for '${SLUG}' has ended."
+
+# The work is finished, as opposed to merely detached from. Only in this state
+# is it reasonable for the exit trap to ask the user anything.
+_CW_SESSION_ENDED=1
 
 # --- 4. Offer cleanup ---
 if ! confirm "Remove worktree and delete branch '${BRANCH}'?"; then

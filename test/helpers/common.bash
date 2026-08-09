@@ -19,7 +19,10 @@ cw() {
 }
 
 setup_fixture() {
-  TESTDIR="$(mktemp -d)"
+  # Physical path: on macOS mktemp hands back /var/..., which is a symlink to
+  # /private/var. The tool resolves its own location with `pwd -P`, so a test
+  # comparing paths would otherwise be comparing two spellings of one directory.
+  TESTDIR="$(cd "$(mktemp -d)" && pwd -P)"
 
   # Unique per run, so tmux session names can never collide between tests.
   REPO_NAME="cwtest$(printf '%s' "$TESTDIR" | tr -dc 'a-zA-Z0-9' | tail -c 8)"
@@ -153,13 +156,66 @@ except subprocess.TimeoutExpired:
 ' "$secs" "$@"
 }
 
+# Serve a fake release: an installer that reports how it was called rather than
+# installing anything, plus a SHA256SUMS that really covers it, so the
+# verification the tool does before running it is exercised for real.
+stub_upgrade_curl() {
+  REL_DIR="${TESTDIR}/rel"
+  mkdir -p "$REL_DIR"
+  cat >"${REL_DIR}/install.sh" <<'EOF'
+#!/bin/sh
+printf 'FAKE-INSTALL %s\n' "$*"
+EOF
+  sed 's/^# Version: .*/# Version: 9.9.9/' "$CW_SCRIPT" >"${REL_DIR}/claude-work"
+  regenerate_release_sums
+
+  CURL_REDIRECT="https://github.com/bjornjohansen/claude-work/releases/tag/v9.9.9"
+  export REL_DIR CURL_REDIRECT
+  cat >"${TESTDIR}/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CURL_LOG"
+[ -z "${CURL_FAIL:-}" ] || exit 7
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  case "$a" in http*) url="$a" ;; esac
+  prev="$a"
+done
+case "$url" in
+*releases/latest) printf '%s' "$CURL_REDIRECT"; exit 0 ;;
+esac
+f=$(basename "${url%%\?*}")
+[ -f "${REL_DIR}/$f" ] || exit 22
+cat "${REL_DIR}/$f" >"$out"
+EOF
+  chmod +x "${TESTDIR}/bin/curl"
+}
+
+regenerate_release_sums() {
+  (cd "$REL_DIR" && shasum -a 256 claude-work install.sh >SHA256SUMS)
+}
+
+# An installed copy outside any git checkout, which is what the upgrade path
+# refuses to act on when it is absent.
+install_copy_at() {
+  mkdir -p "$1"
+  cp "$CW_SCRIPT" "$1/claude-work"
+  chmod +x "$1/claude-work"
+}
+
 # Drive the tool through a pty, answering the given prompts in order.
 cw_pty() {
+  cw_pty_script "$CW_SCRIPT" "$@"
+}
+
+# As cw_pty, but running a specific copy of the script.
+cw_pty_script() {
+  local script="$1"
+  shift
   local answers=()
   while [ "$1" != "--" ]; do
     answers+=("$1")
     shift
   done
   shift
-  python3 "${CW_ROOT}/test/helpers/ptyrun.py" "${answers[@]}" -- "$CW_BASH" "$CW_SCRIPT" "$@"
+  python3 "${CW_ROOT}/test/helpers/ptyrun.py" "${answers[@]}" -- "$CW_BASH" "$script" "$@"
 }
