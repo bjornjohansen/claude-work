@@ -54,20 +54,6 @@ confirm() {
   [[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
 }
 
-# Echo this script's own version, or fail if it cannot be established.
-#
-# The header comment is the single source of truth — install.sh, the CI version
-# check and scripts/bump-version.sh all read it with this same expression. A
-# `CW_VERSION=` constant would be a fourth copy to keep in step, for no gain:
-# nothing on the startup path needs the version, so one sed is affordable here.
-# Fails under `curl ... | bash`, where there is no file to read.
-cw_own_version() {
-  local v
-  v=$(sed -n 's/^# Version:[[:space:]]*//p' "$CW_SELF" 2>/dev/null | head -n 1)
-  case "$v" in '' | *[!0-9.]*) return 1 ;; esac
-  printf '%s\n' "$v"
-}
-
 # True if $1 exists as an executable in one of the system binary directories.
 # Deliberately not `command -v`: PATH is user-controlled, and the caller uses
 # this to decide the text of a sudo command. /usr/local/bin is left out because
@@ -135,6 +121,9 @@ attach_session() {
   if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$1"
     echo "Switched to ${1}. (Already inside tmux — cleanup prompt skipped.)"
+    # switch-client moves the user's attention to another session, so anything
+    # the exit trap printed here would land on a pane they have just left.
+    _CW_QUIET=1
     exit 0
   fi
   tmux attach-session -t "$1"
@@ -162,6 +151,20 @@ attach_session() {
 # host: that would be a tidy foothold for anyone who can set one.
 CW_RELEASES_LATEST_URL="https://github.com/bjornjohansen/claude-work/releases/latest"
 CW_RELEASE_TAG_PREFIX="https://github.com/bjornjohansen/claude-work/releases/tag/v"
+
+# Echo this script's own version, or fail if it cannot be established.
+#
+# The header comment is the single source of truth — install.sh, the CI version
+# check and scripts/bump-version.sh all read it with this same expression. A
+# `CW_VERSION=` constant would be a fourth copy to keep in step, for no gain:
+# nothing on the startup path needs the version, so one sed is affordable here.
+# Fails under `curl ... | bash`, where there is no file to read.
+cw_own_version() {
+  local v
+  v=$(sed -n 's/^# Version:[[:space:]]*//p' "$CW_SELF" 2>/dev/null | head -n 1)
+  case "$v" in '' | *[!0-9.]*) return 1 ;; esac
+  printf '%s\n' "$v"
+}
 
 # The one authority on what a version may look like. Anchored and length-bound.
 # Rejecting "1.2.3-rc1" is deliberate: prereleases must never nag.
@@ -300,6 +303,85 @@ cw_update_fetch() {
   cw_is_semver "$tag" || return 0
 
   cw_cache_write "$now" "$tag" "$CW_DECLINED"
+}
+
+# True if $1 is a strictly newer version than $2.
+#
+# Strictly, so a maintainer running a build ahead of the latest release is never
+# told to downgrade to it. Not `sort -V`, which BSD sort cannot be relied on to
+# have; and not a here-string, which bash 3.2 implements with a temporary file.
+cw_version_gt() {
+  local a="$1" b="$2"
+  local IFS=. i x y
+  local -a n c
+
+  # Both arguments must be captured before the first `set --`, which replaces
+  # the positional parameters this function was called with. Globbing is off
+  # for the same two lines: IFS controls splitting, not expansion, and these
+  # run with the repository as the working directory.
+  set -f
+  # shellcheck disable=SC2086 # splitting on IFS=. is exactly the intent
+  set -- $a
+  n=("$@" 0 0 0)
+  # shellcheck disable=SC2086
+  set -- $b
+  c=("$@" 0 0 0)
+  set +f
+
+  for i in 0 1 2; do
+    # 10# alone is not a safety measure — it fixes "08" being read as octal, but
+    # $(( )) still evaluates command substitutions and array subscripts, so
+    # "0,a[0$(...)]" would run. Callers pass cw_is_semver values; this is the
+    # backstop for the day one of them forgets.
+    case "${n[i]:-0}${c[i]:-0}" in *[!0-9]*) return 1 ;; esac
+    x=$((10#${n[i]:-0}))
+    y=$((10#${c[i]:-0}))
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+  done
+  return 1
+}
+
+# Say a word about a newer release, on the way out.
+#
+# Installed as an EXIT trap rather than called from each of the script's exit
+# points, so it is always the last thing printed and cannot be forgotten when
+# someone adds another exit. It is installed after the preflight, so the usage
+# and missing-dependency paths stay silent — telling someone about a new
+# version while explaining that tmux is missing is just noise.
+_cw_on_exit() {
+  _CW_RC=$?
+  # The shell is already on its way out. Without this, one stray non-zero would
+  # both abandon the rest of the handler and silently turn a successful session
+  # into `exit 1` for anything scripting this tool.
+  set +e
+
+  [ "$_CW_RC" -eq 0 ] || return 0
+  [ -z "${_CW_QUIET:-}" ] || return 0
+  [ -z "${CLAUDE_WORK_NO_UPDATE_CHECK:-}" ] || return 0
+  [ -z "${NO_UPDATE_NOTIFIER:-}" ] || return 0
+  [ -z "${DO_NOT_TRACK:-}" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  [ -t 2 ] || return 0
+
+  cw_cache_read || return 0
+  [ "$CW_LATEST" = "-" ] && return 0
+  # Asked once and declined: do not ask again for that version. Without this the
+  # notice reappears on every run until the user upgrades, which is how a
+  # helpful message turns into one people permanently switch off.
+  [ "$CW_DECLINED" = "$CW_LATEST" ] && return 0
+
+  local mine
+  mine=$(cw_own_version) || return 0
+  cw_version_gt "$CW_LATEST" "$mine" || return 0
+
+  # stderr, so it survives `claude-work foo > log` and stays out of anything
+  # reading this tool's output. Both versions are named: "a new version is
+  # available" without saying which is a message people learn to ignore.
+  echo >&2
+  echo "claude-work ${CW_LATEST} is available (you have ${mine})" >&2
+  echo "  ${CW_RELEASE_TAG_PREFIX}${CW_LATEST}" >&2
+  return 0
 }
 
 # Start the check, unless we have any reason not to. Every test here is a shell
@@ -471,6 +553,10 @@ fi
 # to regain control after attach returns, so we can tell whether Claude Code
 # actually exited (session ended -> offer cleanup) or you just detached
 # (session still alive -> leave everything alone).
+# Installed here so it covers every way out from this point on, including
+# attach_session's early exit, without touching the preflight failures above.
+trap _cw_on_exit EXIT
+
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "tmux session ${SESSION_NAME} already running — attaching."
   attach_session "$SESSION_NAME"
