@@ -142,6 +142,25 @@ run_fetch() {
   "$CW_BASH" -c '. "$1"; set +e; cw_update_fetch' _ "$UPDATE_LIB"
 }
 
+# Run cw_update_spawn on a real pty, with any VAR=value arguments placed in its
+# environment, waiting for the detached child before returning.
+#
+# The pty is the whole point. cw_update_spawn's tty gate sits immediately after
+# the four opt-out checks, so under bats' `run` — which never supplies a
+# terminal — the function returns at the gate and never reaches them. "No
+# request was made" is then true whether the opt-out checks work or not, and a
+# test asserting it proves nothing. Satisfying the gate leaves the opt-out as
+# the only remaining reason for the check not to run.
+#
+# The interval is pinned to 0 so a fresh cache cannot be the thing that
+# suppresses the request either.
+run_spawn_on_pty() {
+  # shellcheck disable=SC2016 # $1 is the argument passed to `bash -c`
+  python3 "${CW_ROOT}/test/helpers/ptyrun.py" -- \
+    env CLAUDE_WORK_UPDATE_INTERVAL=0 "$@" \
+    "$CW_BASH" -c '. "$1"; set +e; cw_update_spawn; wait' _ "$UPDATE_LIB"
+}
+
 # Run a command with a deadline, exiting 124 if it is exceeded. Not `timeout`:
 # that is GNU coreutils and macOS does not ship it. python3 is already required
 # by the pty harness, so this adds no new dependency.

@@ -231,10 +231,23 @@ in_lib() {
 
 @test "each opt-out switch stops the check" {
   local var
+
+  # The control, and the reason the rest of this test means anything: on a pty
+  # with nothing opted out, the check really does make its request. Without it
+  # every assertion below would hold just as well if cw_update_spawn returned
+  # early for some unrelated reason — which is precisely what the earlier
+  # version of this test did. It ran under bats' `run`, which supplies no
+  # terminal, so it stopped at the tty gate and never reached the opt-out
+  # checks it is named for; deleting all four of them left it passing.
+  stub_curl
+  rm -f "$CURL_LOG"
+  run_spawn_on_pty
+  [ -e "$CURL_LOG" ]
+
   for var in CLAUDE_WORK_NO_UPDATE_CHECK NO_UPDATE_NOTIFIER DO_NOT_TRACK CI; do
     stub_curl
     rm -f "$CURL_LOG"
-    run env "${var}=1" "$CW_BASH" -c '. "$1"; set +e; cw_update_spawn; wait' _ "$UPDATE_LIB"
+    run_spawn_on_pty "${var}=1"
     [ ! -e "$CURL_LOG" ]
   done
 }

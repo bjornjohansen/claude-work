@@ -592,7 +592,14 @@ cw_update_spawn() {
   #
   # No disown (a non-interactive shell does no job control, so there is nothing
   # to silence) and no setsid (absent on macOS). --max-time bounds the child's
-  # life; the EXIT trap is not inherited by a subshell, so it cannot fire twice.
+  # life.
+  #
+  # The child cannot fire the EXIT trap a second time because this function is
+  # called before that trap is installed, so there is nothing to inherit at the
+  # moment of the fork. That ordering is the invariant — not any general rule
+  # about subshells, which do get a copy of the traps their parent had set.
+  # Moving this call below `trap _cw_on_exit EXIT` would bring the double fire
+  # back, and the cleanup prompt with it.
   if [ -n "${CLAUDE_WORK_UPDATE_DEBUG:-}" ]; then
     (
       set +e +u +o pipefail
