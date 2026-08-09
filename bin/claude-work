@@ -6,6 +6,7 @@
 #
 # Usage:
 #   claude-work <issue-slug> [base-branch]
+#   claude-work --version
 #
 # Example:
 #   claude-work issue-123
@@ -33,6 +34,14 @@ BASE_BRANCH="${2:-main}"
 REMOTE="${GIT_REMOTE:-origin}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-fix}"
 
+# Where this script lives, resolved before anything cd's away (step 1 below cd's
+# to the repo root, after which a relative $0 would be wrong). $PWD is a shell
+# variable, so this costs no forks — it runs on every invocation. Symlinks are
+# deliberately left unresolved here; only the upgrade path cares, and that can
+# afford the forks.
+CW_SELF="${BASH_SOURCE[0]}"
+case "$CW_SELF" in /*) ;; *) CW_SELF="${PWD}/${CW_SELF}" ;; esac
+
 # --- Helpers ---
 
 # Ask a yes/no question. Returns non-zero (i.e. "no") when stdin is not a
@@ -43,6 +52,20 @@ confirm() {
   [[ -t 0 ]] || return 1
   read -r -p "$1 [y/N] " reply || return 1
   [[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
+}
+
+# Echo this script's own version, or fail if it cannot be established.
+#
+# The header comment is the single source of truth — install.sh, the CI version
+# check and scripts/bump-version.sh all read it with this same expression. A
+# `CW_VERSION=` constant would be a fourth copy to keep in step, for no gain:
+# nothing on the startup path needs the version, so one sed is affordable here.
+# Fails under `curl ... | bash`, where there is no file to read.
+cw_own_version() {
+  local v
+  v=$(sed -n 's/^# Version:[[:space:]]*//p' "$CW_SELF" 2>/dev/null | head -n 1)
+  case "$v" in '' | *[!0-9.]*) return 1 ;; esac
+  printf '%s\n' "$v"
 }
 
 # True if $1 exists as an executable in one of the system binary directories.
@@ -118,6 +141,21 @@ attach_session() {
 }
 
 # --- 0. Preflight ---
+
+# Deliberately a short-circuit rather than an option parser: the contract is
+# `claude-work <issue-slug> [base-branch]` and positional arguments are the
+# whole of it. Without this, `claude-work --version` fails the slug pattern
+# below and reports that a slug must start with a letter or digit.
+case "${1:-}" in
+--version | -V)
+  if CW_V=$(cw_own_version); then
+    printf 'claude-work %s\n' "$CW_V"
+    exit 0
+  fi
+  echo "Error: could not read a version from ${CW_SELF}." >&2
+  exit 1
+  ;;
+esac
 
 if [[ -z "$SLUG" ]]; then
   echo "Usage: $(basename "$0") <issue-slug> [base-branch]" >&2

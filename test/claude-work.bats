@@ -23,6 +23,50 @@ teardown() {
   [[ "$output" == *"Usage: claude-work <issue-slug>"* ]]
 }
 
+@test "--version and -V report the version from the header" {
+  local header
+  header=$(sed -n 's/^# Version:[[:space:]]*//p' "$CW_SCRIPT" | head -n 1)
+  [ -n "$header" ]
+
+  run cw --version
+  [ "$status" -eq 0 ]
+  [ "$output" = "claude-work ${header}" ]
+
+  run cw -V
+  [ "$status" -eq 0 ]
+  [ "$output" = "claude-work ${header}" ]
+}
+
+# The version is read from $CW_SELF, which the script resolves against $PWD
+# before it cd's to the repo root. A relative invocation is the case that would
+# break if that resolution were dropped or moved after the cd.
+@test "--version works when invoked by a relative path" {
+  cp "$CW_SCRIPT" "${TESTDIR}/bin/cw-rel"
+  chmod +x "${TESTDIR}/bin/cw-rel"
+
+  run "$CW_BASH" -c 'cd "$1" && "$2" bin/cw-rel --version' _ "$TESTDIR" "$CW_BASH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "claude-work "* ]]
+}
+
+@test "--version fails loudly rather than reporting an empty version" {
+  local stripped="${TESTDIR}/bin/cw-noheader"
+  grep -v '^# Version:' "$CW_SCRIPT" >"$stripped"
+  chmod +x "$stripped"
+
+  run "$CW_BASH" "$stripped" --version
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not read a version"* ]]
+}
+
+# The short-circuit must not swallow anything else: an unknown flag is still an
+# invalid slug, not a silently accepted option.
+@test "an unknown flag is still rejected as a slug" {
+  run cw --definitely-not-a-flag
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"slug must start with a letter or digit"* ]]
+}
+
 @test "rejects slugs that are unsafe as a path, refname or tmux target" {
   for slug in "../evil" "a:b" "a..b" "-lead" ".hidden" "has space"; do
     run cw "$slug"
