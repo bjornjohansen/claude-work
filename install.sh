@@ -384,8 +384,13 @@ fetch_binary() {
     return 0
   fi
 
-  [ -n "$actual" ] && [ "$actual" = "$expected" ] ||
+  # Spelled out rather than `A && B || die`: that form is SC2015, and on the
+  # one comparison the whole verification rests on it should not take a reader
+  # a moment to confirm that the failure branch really does cover both an empty
+  # hash and a mismatched one.
+  if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
     die "checksum mismatch — refusing to install ${BIN_NAME}"
+  fi
   info "Checksum verified."
 }
 
